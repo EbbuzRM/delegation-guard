@@ -6,38 +6,97 @@ The Guard is fully deterministic — no LLM dependencies. Every rule is codified
 
 ## Installation
 
-Copy these 2 files to the OpenCode plugins directory:
+### Files
 
-1. **`delegation-guard.js`** → copy to:
-   ```
-   C:\Users\Ebby\.opencode\plugins\
-   ```
+| File | Destination | Description |
+|------|-------------|-------------|
+| `delegation-guard.js` | `<your-opencode-dir>/plugins/` | Main plugin code |
+| `guard-config.json` | `<your-opencode-dir>/plugins/` | Agent profiles configuration |
 
-2. **`guard-config.json`** → copy to the same directory:
-   ```
-   C:\Users\Ebby\.opencode\plugins\
-   ```
+Copy both files to the same directory. OpenCode loads plugins automatically at startup.
 
-OpenCode automatically loads the plugin at startup — no further configuration needed.
+### Test Harness (Optional)
+
+`test-harness2.mjs` is an automated test suite (34 scenarios) that verifies all guard behaviors. To run it:
+
+1. Copy `delegation-guard.js` and `guard-config.json` to the plugin directory
+2. Edit the import path in `test-harness2.mjs` if your plugin directory differs from the default
+3. Run: `node test-harness2.mjs`
+
+The test harness imports from `./delegation-guard.js` — make sure the path matches your setup.
+
+## Customizing Agent Profiles
+
+The default `guard-config.json` ships with a full set of pre-configured agents. You can:
+
+1. **Keep the defaults** — copy `guard-config.json` as-is and start using the guard immediately
+2. **Customize existing agents** — modify permissions, bash allowlists, delegation rules, or write scopes for any agent
+3. **Add new agents** — create new agent entries following the same schema
+
+Each agent profile supports these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `role` | string | Human-readable agent role |
+| `allowEdit` | boolean | Whether the agent can use the `edit` tool |
+| `bashAllowlist` | string[] | Allowed bash command patterns (`["*"]` = all) |
+| `readOnlyDespiteFullBash` | boolean | Block shell mutations even with full bash access |
+| `canWebfetch` | boolean | Whether the agent can use `webfetch` |
+| `canDelegateTo` | string[] | Which agents this agent can delegate to (`["*"]` = all) |
+| `canPreDelegate` | boolean | Whether the agent can operate in pre-delegation phase |
+| `writeScope` | string | Restricted write directory (e.g., `sketches`, `spikes`, `planning`, `readme`, `all`) |
+| `noTestExecution` | boolean | Block test execution via bash (e.g., `npm test`, `pytest`) |
+| `delegation_rules` | object | Domain routing rules (`can_handle_directly` + `must_delegate_to`) |
+
+### Delegation Rules Schema
+
+```json
+"delegation_rules": {
+  "can_handle_directly": ["implementation", "bugfix"],
+  "must_delegate_to": {
+    "verification": "verifier",
+    "testing": "tester"
+  }
+}
+```
+
+- `can_handle_directly`: domains this agent processes itself
+- `must_delegate_to`: domains that must be routed to a specific agent
+
+### Adding a Custom Agent
+
+```json
+"my-custom-agent": {
+  "role": "my custom role",
+  "allowEdit": true,
+  "bashAllowlist": ["npm *", "node *"],
+  "canWebfetch": false,
+  "canDelegateTo": ["explorer"],
+  "canPreDelegate": false,
+  "writeScope": "all",
+  "delegation_rules": {
+    "can_handle_directly": ["my_domain"],
+    "must_delegate_to": {}
+  }
+}
+```
+
+> **Note**: Custom agents also require a matching OpenCode agent definition file in your `.config/opencode/agents/` directory. The guard config alone does not create the agent — it only defines its permissions and routing.
 
 ## Custom Paths (Optional)
 
-If you want to use different paths for:
-- The `.planning` directory (used for audit trail, incident log, guard-init.log)
-- The plugin location itself
+The guard uses several relative paths for logging and audit trails. All paths are relative to the plugin directory (`__dirname`):
 
-You can modify the following paths directly in `delegation-guard.js`:
+| Path | Purpose | Customizable |
+|------|---------|--------------|
+| `.planning/guard-init.log` | Plugin bootstrap log | Yes — edit `initLogPath` in the factory |
+| `.planning/audit/audit-YYYY-MM-DD.jsonl` | Structured audit trail | Yes — edit audit path in the plugin |
+| `.planning/INCIDENTS.md` | Security block incidents (project dir) | Yes |
+| `delegation-guard/guard-debug.jsonl` | Full I/O debug log | Yes — edit debug path |
+| `delegation-guard-runtime.log` | Operational runtime log | Yes — edit `runtimeLogPath` |
+| `.opencode/metrics_count.json` | Incident counters (project dir) | Yes |
 
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `__dirname` | Plugin directory | Base path for all relative paths |
-| `.planning/` | Inside `__dirname` | Audit trail, incidents, guard-init.log |
-| `delegation-guard/` | Inside `__dirname` | Debug I/O log (guard-debug.jsonl) |
-| `delegation-guard-runtime.log` | Inside `__dirname` | Operational runtime log |
-
-To change the `.planning` location, modify the path in the plugin factory where `initLogPath` is created and where the audit trail is written.
-
-To move the entire plugin, copy `delegation-guard.js` to the new location and update the path in `opencode.json` under the plugins section.
+To change these paths, edit the corresponding constants in `delegation-guard.js`.
 
 ## Configuration
 
@@ -292,7 +351,7 @@ Every blocked action displays a real-time error toast in the OpenCode interface,
 
 Check functions are **private to the plugin closure** — no named exports. Tests verify behavior via the public API (`DelegationGuard` factory) by instantiating the guard with a mock client and simulating tool calls through the `tool.execute.before` hook.
 
-`test-harness2.mjs` covers 7 main suites:
+`test-harness2.mjs` is included in this repository and covers 8 main suites:
 1. Routing / domain declaration
 2. Workflow sequence (fix requires diagnosis)
 3. Sensitive file protection (read/grep/glob/edit/write/bash)
@@ -300,3 +359,12 @@ Check functions are **private to the plugin closure** — no named exports. Test
 5. Shell mutation for `readOnlyDespiteFullBash` agents
 6. Orchestrator tool restrictions
 7. Swarm Mode — same-type parallel OK, cross-type blocked
+8. Orchestrator hijack guard (subagent auto-delegation before crystallization)
+
+## Key File Paths
+
+| File | Purpose |
+|------|---------|
+| `delegation-guard.js` | Main plugin code (DelegationGuard factory + `tool.execute.before` hook) |
+| `guard-config.json` | Agent profiles (runtime priority over JS fallback) |
+| `test-harness2.mjs` | Automated test suite (34 scenarios) |
