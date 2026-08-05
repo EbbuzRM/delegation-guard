@@ -79,10 +79,21 @@ git clone https://github.com/EbbuzRM/delegation-guard.git
 cd delegation-guard
 ```
 
-2. Copy the default configuration:
-```bash
-cp guard-config.json.example guard-config.json
-```
+2. Copy the default configuration and install the guard script as an OpenCode plugin:
+
+   **Unix / macOS:**
+   ```bash
+   mkdir -p ~/.config/opencode/plugins/delegation-guard
+   cp delegation-guard.js ~/.config/opencode/plugins/delegation-guard/
+   cp  guard-config.json  ~/.config/opencode/plugins/delegation-guard/
+   ```
+
+   **Windows (PowerShell):**
+   ```powershell
+   New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.config\opencode\plugins\delegation-guard" | Out-Null
+   Copy-Item guard-config.json "$env:USERPROFILE\.config\opencode\plugins\delegation-guard\"
+   Copy-Item delegation-guard.js "$env:USERPROFILE\.config\opencode\plugins\delegation-guard\"
+   ```
 
 3. Ensure the guard is loaded by OpenCode as a plugin (see [OpenCode plugin documentation](https://docs.opencode.ai/plugins)).
 
