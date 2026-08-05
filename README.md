@@ -10,10 +10,14 @@ The Guard is fully deterministic — no LLM dependencies. Every rule is codified
 
 | File | Destination | Description |
 |------|-------------|-------------|
-| `delegation-guard.js` | `<your-opencode-dir>/plugins/` | Main plugin code |
-| `guard-config.json` | `<your-opencode-dir>/plugins/` | Agent profiles configuration |
+| `delegation-guard.js` | See below | Main plugin code |
+| `guard-config.json` | See below | Agent profiles configuration |
 
-Copy both files to the same directory. OpenCode loads plugins automatically at startup.
+Copy both files to the same plugin directory:
+
+- **Windows**: `C:\Users\<your_user>\.opencode\plugins\`
+- **Linux**: `~/.opencode/plugins/`
+- **macOS**: `~/.opencode/plugins/`
 
 ### Test Harness (Optional)
 
