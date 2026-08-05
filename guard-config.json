@@ -1,0 +1,404 @@
+{
+  "agentProfiles": {
+    "codebase-mapper": {
+      "role": "mappatura codebase",
+      "allowEdit": false,
+      "bashAllowlist": [
+        "*"
+      ],
+      "canWebfetch": false,
+      "canDelegateTo": [
+        "explorer"
+      ],
+      "canPreDelegate": true,
+      "writeScope": "all",
+      "delegation_rules": {
+        "can_handle_directly": [
+          "exploration",
+          "code_search",
+          "architecture_analysis",
+          "dependency_mapping"
+        ],
+        "must_delegate_to": {
+          "implementation": "executor",
+          "refactor": "executor",
+          "bugfix": "executor",
+          "deployment": "executor",
+          "configuration": "executor",
+          "verification": "verifier",
+          "testing": "tester",
+          "documentation": "doc-writer",
+          "debugging": "debugger",
+          "security_audit": "security-auditor",
+          "code_review": "code-reviewer",
+          "ui_prototyping": "sketcher",
+          "feasibility_spike": "spiker"
+        }
+      },
+      "readOnlyDespiteFullBash": true
+    },
+    "code-reviewer": {
+      "role": "analisi codice",
+      "allowEdit": false,
+      "bashAllowlist": [
+        "*"
+      ],
+      "canWebfetch": false,
+      "canDelegateTo": [
+        "executor"
+      ],
+      "canPreDelegate": false,
+      "writeScope": "all",
+      "delegation_rules": {
+        "can_handle_directly": [
+          "code_review",
+          "quality_analysis"
+        ],
+        "must_delegate_to": {
+          "implementation": "executor",
+          "refactor": "executor",
+          "bugfix": "executor",
+          "deployment": "executor",
+          "configuration": "executor",
+          "verification": "verifier",
+          "testing": "tester",
+          "documentation": "doc-writer",
+          "debugging": "debugger",
+          "exploration": "explorer",
+          "security_audit": "security-auditor",
+          "ui_prototyping": "sketcher",
+          "feasibility_spike": "spiker"
+        }
+      },
+      "readOnlyDespiteFullBash": true
+    },
+    "debugger": {
+      "role": "diagnosi",
+      "allowEdit": false,
+      "bashAllowlist": [
+        "*"
+      ],
+      "canWebfetch": true,
+      "canDelegateTo": [
+        "executor",
+        "tester",
+        "verifier"
+      ],
+      "canPreDelegate": false,
+      "writeScope": "all",
+      "delegation_rules": {
+        "can_handle_directly": [
+          "debugging",
+          "root_cause",
+          "error_analysis",
+          "stack_trace"
+        ],
+        "must_delegate_to": {
+          "implementation": "executor",
+          "refactor": "executor",
+          "bugfix": "executor",
+          "deployment": "executor",
+          "configuration": "executor",
+          "verification": "verifier",
+          "testing": "tester",
+          "documentation": "doc-writer",
+          "exploration": "explorer",
+          "security_audit": "security-auditor",
+          "code_review": "code-reviewer",
+          "ui_prototyping": "sketcher",
+          "feasibility_spike": "spiker"
+        }
+      },
+      "readOnlyDespiteFullBash": true
+    },
+    "doc-writer": {
+      "role": "documentazione",
+      "allowEdit": true,
+      "bashAllowlist": [],
+      "canWebfetch": false,
+      "canDelegateTo": [
+        "executor",
+        "verifier",
+        "doc-writer",
+        "explorer"
+      ],
+      "canPreDelegate": false,
+      "writeScope": "readme",
+      "delegation_rules": {
+        "can_handle_directly": [
+          "documentation",
+          "readme",
+          "changelog",
+          "api_docs"
+        ],
+        "must_delegate_to": {
+          "implementation": "executor",
+          "refactor": "executor",
+          "bugfix": "executor",
+          "deployment": "executor",
+          "configuration": "executor",
+          "verification": "verifier",
+          "testing": "tester",
+          "debugging": "debugger",
+          "exploration": "explorer",
+          "security_audit": "security-auditor",
+          "code_review": "code-reviewer",
+          "ui_prototyping": "sketcher",
+          "feasibility_spike": "spiker"
+        }
+      }
+    },
+    "executor": {
+      "role": "implementazione",
+      "allowEdit": true,
+      "bashAllowlist": [
+        "*"
+      ],
+      "canWebfetch": true,
+      "canDelegateTo": [
+        "*"
+      ],
+      "canPreDelegate": false,
+      "writeScope": "all",
+      "delegation_rules": {
+        "can_handle_directly": [
+          "implementation",
+          "refactor",
+          "bugfix",
+          "deployment",
+          "configuration",
+          "execution"
+        ],
+        "must_delegate_to": {
+          "verification": "verifier",
+          "testing": "tester",
+          "documentation": "doc-writer",
+          "debugging": "debugger",
+          "exploration": "explorer",
+          "security_audit": "security-auditor",
+          "code_review": "code-reviewer",
+          "ui_prototyping": "sketcher",
+          "feasibility_spike": "spiker"
+        }
+      },
+      "noTestExecution": true
+    },
+    "explorer": {
+      "role": "ricerca",
+      "allowEdit": false,
+      "bashAllowlist": [
+        "*"
+      ],
+      "canWebfetch": true,
+      "canDelegateTo": [
+        "executor",
+        "verifier",
+        "doc-writer",
+        "explorer"
+      ],
+      "canPreDelegate": true,
+      "writeScope": "planning",
+      "delegation_rules": {
+        "can_handle_directly": [
+          "exploration",
+          "code_search",
+          "architecture_analysis",
+          "dependency_mapping"
+        ],
+        "must_delegate_to": {
+          "implementation": "executor",
+          "refactor": "executor",
+          "bugfix": "executor",
+          "deployment": "executor",
+          "configuration": "executor",
+          "verification": "verifier",
+          "testing": "tester",
+          "documentation": "doc-writer",
+          "debugging": "debugger",
+          "security_audit": "security-auditor",
+          "code_review": "code-reviewer",
+          "ui_prototyping": "sketcher",
+          "feasibility_spike": "spiker"
+        }
+      },
+      "readOnlyDespiteFullBash": true
+    },
+    "security-auditor": {
+      "role": "audit security",
+      "allowEdit": false,
+      "bashAllowlist": [
+        "*"
+      ],
+      "canWebfetch": false,
+      "canDelegateTo": [
+        "executor"
+      ],
+      "canPreDelegate": false,
+      "writeScope": "all",
+      "delegation_rules": {
+        "can_handle_directly": [
+          "security_audit",
+          "vulnerability_scan"
+        ],
+        "must_delegate_to": {
+          "implementation": "executor",
+          "refactor": "executor",
+          "bugfix": "executor",
+          "deployment": "executor",
+          "configuration": "executor",
+          "verification": "verifier",
+          "testing": "tester",
+          "documentation": "doc-writer",
+          "debugging": "debugger",
+          "exploration": "explorer",
+          "code_review": "code-reviewer",
+          "ui_prototyping": "sketcher",
+          "feasibility_spike": "spiker"
+        }
+      },
+      "readOnlyDespiteFullBash": true
+    },
+    "sketcher": {
+      "role": "prototipi UI",
+      "allowEdit": true,
+      "bashAllowlist": [],
+      "canWebfetch": false,
+      "canDelegateTo": [
+        "executor",
+        "verifier",
+        "doc-writer",
+        "explorer"
+      ],
+      "canPreDelegate": false,
+      "writeScope": "sketches",
+      "delegation_rules": {
+        "can_handle_directly": [
+          "ui_prototyping",
+          "mockup",
+          "wireframe"
+        ],
+        "must_delegate_to": {
+          "implementation": "executor",
+          "refactor": "executor",
+          "bugfix": "executor",
+          "deployment": "executor",
+          "configuration": "executor",
+          "verification": "verifier",
+          "testing": "tester",
+          "documentation": "doc-writer",
+          "debugging": "debugger",
+          "exploration": "explorer",
+          "security_audit": "security-auditor",
+          "code_review": "code-reviewer",
+          "feasibility_spike": "spiker"
+        }
+      }
+    },
+    "spiker": {
+      "role": "prototipi throwaway",
+      "allowEdit": true,
+      "bashAllowlist": [
+        "*"
+      ],
+      "canWebfetch": false,
+      "canDelegateTo": [
+        "*"
+      ],
+      "canPreDelegate": false,
+      "writeScope": "spikes",
+      "delegation_rules": {
+        "can_handle_directly": [
+          "feasibility_spike",
+          "throwaway_prototype"
+        ],
+        "must_delegate_to": {
+          "implementation": "executor",
+          "refactor": "executor",
+          "bugfix": "executor",
+          "deployment": "executor",
+          "configuration": "executor",
+          "verification": "verifier",
+          "testing": "tester",
+          "documentation": "doc-writer",
+          "debugging": "debugger",
+          "exploration": "explorer",
+          "security_audit": "security-auditor",
+          "code_review": "code-reviewer",
+          "ui_prototyping": "sketcher"
+        }
+      }
+    },
+    "tester": {
+      "role": "scrittura test",
+      "allowEdit": true,
+      "bashAllowlist": [],
+      "canWebfetch": false,
+      "canDelegateTo": [
+        "executor"
+      ],
+      "canPreDelegate": false,
+      "writeScope": "all",
+      "delegation_rules": {
+        "can_handle_directly": [
+          "testing",
+          "e2e",
+          "unit_test",
+          "test_creation"
+        ],
+        "must_delegate_to": {
+          "implementation": "executor",
+          "refactor": "executor",
+          "bugfix": "executor",
+          "deployment": "executor",
+          "configuration": "executor",
+          "verification": "verifier",
+          "documentation": "doc-writer",
+          "debugging": "debugger",
+          "exploration": "explorer",
+          "security_audit": "security-auditor",
+          "code_review": "code-reviewer",
+          "ui_prototyping": "sketcher",
+          "feasibility_spike": "spiker"
+        }
+      }
+    },
+    "verifier": {
+      "role": "validazione",
+      "allowEdit": false,
+      "bashAllowlist": [
+        "*"
+      ],
+      "canWebfetch": false,
+      "canDelegateTo": [
+        "executor",
+        "doc-writer"
+      ],
+      "canPreDelegate": false,
+      "writeScope": "all",
+      "delegation_rules": {
+        "can_handle_directly": [
+          "verification",
+          "validation",
+          "review",
+          "linting"
+        ],
+        "must_delegate_to": {
+          "implementation": "executor",
+          "refactor": "executor",
+          "bugfix": "executor",
+          "deployment": "executor",
+          "configuration": "executor",
+          "testing": "tester",
+          "documentation": "doc-writer",
+          "debugging": "debugger",
+          "exploration": "explorer",
+          "security_audit": "security-auditor",
+          "code_review": "code-reviewer",
+          "ui_prototyping": "sketcher",
+          "feasibility_spike": "spiker"
+        }
+      },
+      "readOnlyDespiteFullBash": true
+    }
+  }
+}
