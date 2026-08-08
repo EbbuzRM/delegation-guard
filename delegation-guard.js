@@ -364,6 +364,29 @@ const SECRET_PATTERNS = [
 ]
 
 /**
+ * File di log/lezioni auto-scritti dal Guard o dall'orchestratore.
+ * Contengono MENZIONI testuali di path sensibili come esempio storico
+ * (es. "File: .ssh/id_rsa, Pattern: ssh_keys" in un log di blocco passato),
+ * non secret reali. Esclusi da checkSecretsInOutput per evitare falsi positivi
+ * quando un agente li rilegge (bug 08-08: lessons.md redatto 2 volte per
+ * "Generic private key path" pur non contenendo alcuna chiave).
+ * @type {string[]}
+ */
+const SECRET_SCAN_EXCLUDED_FILES = [
+  'lessons.md',
+  'delegation-guard-runtime.log',
+  'guard-debug.jsonl',
+  'guard-init.log',
+  'incidents.md'
+]
+
+function isSecretScanExcluded(filePath) {
+  if (!filePath || typeof filePath !== 'string') return false
+  const normalized = filePath.replace(/\\/g, '/').toLowerCase()
+  return SECRET_SCAN_EXCLUDED_FILES.some(name => normalized === name || normalized.endsWith('/' + name))
+}
+
+/**
  * Pattern per il check C (sensitive file access).
  * Blocca read/grep/glob su file che contengono credenziali.
  *
@@ -416,7 +439,13 @@ function isDocumentationTask(text) {
   // Check 1: se il task modifica codice (.py, .js, .ts, .java, .cs, ecc.) → non è doc
   const codeFilePattern = /[\w\-./\\:]+\.(?:py|js|ts|java|cs|cpp|c|go|rs|rb|php|swift|kt|scala|ex|exs|spec|r|m|mm|pl|pm|lua|hs|sh|bash|zsh|ps1|bat|cmd|yaml|yml|json|xml|ini|cfg|toml|env|css|scss|html|htm|vue|svelte|jsx|tsx)\b/i
   if (codeFilePattern.test(text)) return false
-  // Check 2: solo se non è codice, verifica se sta scrivendo doc
+  // Check 1b: dotfile di config senza estensione (.gitignore, .env, ecc.) → non è doc.
+  // Bug 08-05: task "rimuovi X da .gitignore" menzionava anche "CLAUDE.md" come
+  // riferimento testuale (non il file da editare) → matchava Check 2 e rediriggeva
+  // erroneamente a doc-writer. Un dotfile di config nel testo vince su una menzione .md/.txt.
+  const configDotfilePattern = /(?:^|[\s"'`/\\])\.(?:gitignore|dockerignore|eslintrc(?:\.\w+)?|prettierrc(?:\.\w+)?|editorconfig|npmrc|env(?:\.\w+)?|nvmrc|browserslistrc|babelrc|stylelintrc|huskyrc)\b/i
+  if (configDotfilePattern.test(text)) return false
+  // Check 2: solo se non è codice/config, verifica se sta scrivendo doc
   const docFilePattern = /[\w\-./\\:]+\.(?:md|txt)\b/i
   return docFilePattern.test(text)
 }
@@ -1314,7 +1343,8 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
         if (!profile) return
 
         const auditLog = state.secretDetectionAudit || (state.secretDetectionAudit = [])
-        checkSecretsInOutput(output?.output || output?.metadata || output, state.lastAgent, profile, auditLog)
+        const filePath = output?.args?.filePath || output?.args?.pattern || input.args?.filePath || input.args?.pattern || input.args?.path || ''
+        checkSecretsInOutput(output?.output || output?.metadata || output, state.lastAgent, profile, auditLog, filePath)
       } catch (e) {
         // Hook after non può bloccare originariamente, ma modificando l'oggetto output per riferimento
         // possiamo redigere attivamente i secret prima che tornino a OpenCode.
@@ -2222,15 +2252,18 @@ function checkTaskSubDelegation(caller, callerProfile, target, allProfiles) {
  * @param {string} subagent - Nome del subagent
  * @param {any} profile - Profilo agente (opzionale, ma obbligatorio per fail-closed)
  * @param {any[]} [auditLog] - Array opzionale dove pushare record di detection
+ * @param {string} [filePath] - Path del file letto (se applicabile), per esclusione log/lezioni del Guard
  * @throws {Error} se profile mancante o se viene trovato un secret
  */
-function checkSecretsInOutput(output, subagent, profile, auditLog) {
+function checkSecretsInOutput(output, subagent, profile, auditLog, filePath) {
   if (!output) return
   if (!profile) {
     throw new Error(`❌ GUARD: profile mancante per checkSecretsInOutput (subagent: ${subagent})`)
   }
   // Trusted agents (es. executor con canDelegateTo:["*"]) → skip
   if (Array.isArray(profile.canDelegateTo) && profile.canDelegateTo.includes('*')) return
+  // File di log/lezioni del Guard → skip (menzioni di path, non secret reali)
+  if (isSecretScanExcluded(filePath)) return
 
   const text = typeof output === 'string' ? output : JSON.stringify(output)
   if (!text) return
