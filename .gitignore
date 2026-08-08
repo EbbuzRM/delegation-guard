@@ -1,0 +1,5 @@
+delegation-guard-runtime.log
+delegation-guard/
+.planning/
+node_modules/
+sync-from-opencode.ps1
