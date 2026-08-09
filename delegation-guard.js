@@ -970,6 +970,21 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
         }
       }
 
+      // 2.6. GATE: conductor-rules deve essere caricata prima della prima delega.
+      // Una volta per sessione (state.conductorRulesLoaded persiste in sessionState) —
+      // non ricarica ad ogni prompt, blocca solo il primo `task` finché l'Orchestratore
+      // non ha chiamato Skill('conductor-rules').
+      if (isOrchestrator) {
+        if (input.tool === 'skill' && output?.args?.name === 'conductor-rules') {
+          state.conductorRulesLoaded = true;
+          sessionState.set(sessionID, state);
+        } else if (input.tool === 'task' && !state.conductorRulesLoaded) {
+          auditedCheck(sessionID, 'orchestrator', 'conductor_rules_gate', () => {
+            throw new Error(`❌ ORCHESTRATOR: devi prima caricare Skill('conductor-rules') prima di delegare.`);
+          }, { tool: input.tool });
+        }
+      }
+
       // 3. PRIORITÀ ASSOLUTA: CHECK FILE SENSIBILI (Sempre attivo)
       if (['read', 'grep', 'glob'].includes(input.tool)) {
         const profileForC = subagentType ? agentProfiles[subagentType] : null;
@@ -1621,7 +1636,8 @@ function createSessionState() {
     secretDetectionAudit: /** @type {any[]} */ ([]),
     delegationStack: /** @type {string[]} */ ([]),
     delegationSequence: /** @type {string[]} */ ([]),
-    taskRetries: /** @type {Record<string, number>} */ ({})
+    taskRetries: /** @type {Record<string, number>} */ ({}),
+    conductorRulesLoaded: false
   }
 }
 

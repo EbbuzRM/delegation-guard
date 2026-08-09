@@ -15,7 +15,30 @@ const failures = [];
 let callID = 0;
 let subCounter = 0;
 
+async function preloadConductorRules(guardObj, sessionID) {
+  // Normalizza come fa internamente l'hook (input.sessionID || 'default') —
+  // orchSession può arrivare undefined da chiamanti che lasciano il default.
+  const sid = sessionID || 'default';
+  // Registra sid come root session (Orchestratore) via l'event hook
+  // "session.created" — stesso meccanismo di produzione (vedi guard4/event4
+  // sotto) — così isOrchestrator risolve true per questa sessionID SUBITO,
+  // senza dover passare da una vera task call (che self-heala solo DOPO,
+  // troppo tardi per sbloccare il gate sulla task call stessa).
+  const eventFn = guardObj['event'];
+  if (eventFn) {
+    await eventFn({ event: { type: 'session.created', properties: { sessionID: sid, info: { agent: 'orchestrator' } } } });
+  }
+  const beforeFn = guardObj['tool.execute.before'];
+  callID++;
+  return beforeFn(
+    { tool: 'skill', sessionID: sid, callID: 'call_' + callID },
+    { args: { name: 'conductor-rules' } }
+  ).catch(() => {});
+}
+
 async function delegateAndCrystallize(subagentType, description, prompt, orchSession) {
+  // 0. Precarica conductor-rules per non incappare nel gate 2.6 (non è il focus qui)
+  await preloadConductorRules(guard, orchSession);
   // 1. L'Orchestratore delega (dalla sua sessione)
   callID++;
   await before(
@@ -53,7 +76,9 @@ function call(tool, sessionID, args) {
   callID++;
   return before({ tool, sessionID, callID: 'call_' + callID, args }, { args });
 }
-function taskCall(subagentType, description, prompt, orchSession = 'ses_orch_' + (++subCounter)) {
+async function taskCall(subagentType, description, prompt, orchSession = 'ses_orch_' + (++subCounter)) {
+  // Precarica conductor-rules per non incappare nel gate 2.6 (non è il focus qui)
+  await preloadConductorRules(guard, orchSession);
   callID++;
   return before(
     { tool: 'task', sessionID: orchSession, callID: 'call_' + callID },
@@ -177,6 +202,7 @@ console.log('--- 7. SWARM MODE: parallelo stesso agente OK, tipi diversi bloccat
   }
 
   const orchSessionA = 'ses_orch_swarm_testA';
+  await preloadConductorRules(guard2, orchSessionA);
   await expectPass('primo executor in parallelo', () =>
     taskCall2('executor', 'domain:implementation - step1', 'domain:implementation causa root nota, step1', orchSessionA));
   await expectPass('secondo executor in parallelo (swarm, stesso tipo OK)', () =>
@@ -195,6 +221,7 @@ console.log('--- 7. SWARM MODE: parallelo stesso agente OK, tipi diversi bloccat
       { args: { subagent_type: subagentType, description, prompt } }
     );
   }
+  await preloadConductorRules(guard3, orchSessionB);
   await expectPass('prima delega explorer', () =>
     taskCall3('explorer', 'domain:exploration - ctx', 'domain:exploration raccogli contesto', orchSessionB));
   await expectBlock('delega parallela tipo diverso bloccata (explorer ancora pending)', () =>
@@ -222,6 +249,7 @@ console.log('--- 8. ORCHESTRATOR HIJACK GUARD: subagent auto-delega prima di cri
   }
 
   const orchSession = 'ses_orch_hijack_test';
+  await preloadConductorRules(guard4, orchSession);
   callID++;
   await before4(
     { tool: 'task', sessionID: orchSession, callID: 'call_' + callID },
@@ -248,6 +276,71 @@ console.log('--- 8. ORCHESTRATOR HIJACK GUARD: subagent auto-delega prima di cri
 
   await expectPass('verifier NON scambiato per Orchestratore dopo aver delegato', () =>
     call4('read', verifierSession, { filePath: '/home/claude/fake-project-hijack/y.txt' }));
+}
+
+console.log('--- 9. CONDUCTOR-RULES GATE: skill deve essere caricata prima della prima delega ---');
+{
+  const guardGateBlock = await DelegationGuard({
+    project: { id: 'test-project-gate-block' }, client: mockClient, $: async () => {},
+    directory: '/home/claude/fake-project-gate-block', worktree: '/'
+  });
+  const beforeGB = guardGateBlock['tool.execute.before'];
+  await expectBlock('orchestratore delega senza aver caricato conductor-rules', () => {
+    callID++;
+    return beforeGB(
+      { tool: 'task', sessionID: 'ses_orch_gate_block', callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - test gate', prompt: 'domain:implementation causa root nota, test gate' } }
+    );
+  }, 'conductor-rules');
+}
+{
+  const guardGateAllow = await DelegationGuard({
+    project: { id: 'test-project-gate-allow' }, client: mockClient, $: async () => {},
+    directory: '/home/claude/fake-project-gate-allow', worktree: '/'
+  });
+  const beforeGA = guardGateAllow['tool.execute.before'];
+  await expectPass('orchestratore carica conductor-rules poi delega con successo', async () => {
+    callID++;
+    await beforeGA(
+      { tool: 'skill', sessionID: 'ses_orch_gate_allow', callID: 'call_' + callID },
+      { args: { name: 'conductor-rules' } }
+    );
+    callID++;
+    await beforeGA(
+      { tool: 'task', sessionID: 'ses_orch_gate_allow', callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - test gate ok', prompt: 'domain:implementation causa root nota, test gate ok' } }
+    );
+  });
+}
+{
+  const guardGateSub = await DelegationGuard({
+    project: { id: 'test-project-gate-sub' }, client: mockClient, $: async () => {},
+    directory: '/home/claude/fake-project-gate-sub', worktree: '/'
+  });
+  const beforeGS = guardGateSub['tool.execute.before'];
+  const orchSessionGS = 'ses_orch_gate_sub_setup';
+  callID++;
+  await beforeGS(
+    { tool: 'task', sessionID: orchSessionGS, callID: 'call_' + callID },
+    { args: { subagent_type: 'verifier', description: 'domain:verification - setup subagent', prompt: 'domain:verification setup subagent per gate test' } }
+  ).catch(() => {});
+
+  const subSessionGS = 'ses_sub_gate_nonorch';
+  // Cristallizza l'identità del subagent (lastAgent=verifier) con una tool call reale,
+  // come nelle altre sezioni (es. delegateAndCrystallize).
+  callID++;
+  await beforeGS(
+    { tool: 'read', sessionID: subSessionGS, callID: 'call_' + callID, args: { filePath: '/home/claude/fake-project-gate-sub/x.txt' } },
+    { args: { filePath: '/home/claude/fake-project-gate-sub/x.txt' } }
+  );
+
+  await expectPass('subagent (non orchestratore) delega senza essere soggetto al gate conductor-rules', () => {
+    callID++;
+    return beforeGS(
+      { tool: 'task', sessionID: subSessionGS, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - delega da subagent', prompt: 'domain:implementation causa root nota, delega da subagent' } }
+    );
+  });
 }
 
 console.log(`\n=== RISULTATI: ${pass} passati, ${fail} falliti su ${pass+fail} test ===\n`);
