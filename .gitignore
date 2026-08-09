@@ -3,3 +3,4 @@ delegation-guard/
 .planning/
 node_modules/
 sync-from-opencode.ps1
+setup-autostart.ps1
