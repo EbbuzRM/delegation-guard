@@ -799,6 +799,34 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
     }
   }
 
+  /**
+   * Verifica nello storico messaggi della sessione se Skill('conductor-rules')
+   * è già stata caricata in precedenza.
+   *
+   * Serve a coprire il caso in cui il processo del plugin sia stato riavviato
+   * (es. chiusura/riapertura di OpenCode): la Map in-memory `sessionState` torna
+   * vuota, ma se la sessione ripresa ha lo stesso sessionID e le regole sono già
+   * nello storico/contesto, il gate non deve richiederne il ricaricamento.
+   * @param {string} sessionID
+   * @returns {Promise<boolean>}
+   */
+  async function wasConductorRulesLoadedInHistory(sessionID) {
+    try {
+      const res = await client.session.messages({ path: { id: sessionID } });
+      const messages = res?.data || [];
+      for (const msg of messages) {
+        for (const part of msg.parts || []) {
+          if (part.type === 'tool' && part.tool === 'skill' && part.state?.input?.name === 'conductor-rules') {
+            return true;
+          }
+        }
+      }
+    } catch (e) {
+      runtimeLog(`wasConductorRulesLoadedInHistory failed: ${e.message}`);
+    }
+    return false;
+  }
+
   // ============================================
   // HOOK PRINCIPALE — DISPATCHER MODULARE
   // ============================================
@@ -974,14 +1002,23 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
       // Una volta per sessione (state.conductorRulesLoaded persiste in sessionState) —
       // non ricarica ad ogni prompt, blocca solo il primo `task` finché l'Orchestratore
       // non ha chiamato Skill('conductor-rules').
+      // Fix 2026-08-11: sessionState è una Map in-memory (chiude col processo del
+      // plugin) — se OpenCode viene chiuso e riaperto sulla STESSA sessione, il flag
+      // si perde anche se le regole sono già nel contesto/storico. wasConductorRulesLoadedInHistory
+      // controlla lo storico messaggi prima di bloccare, per non richiedere un ricaricamento inutile.
       if (isOrchestrator) {
         if (input.tool === 'skill' && output?.args?.name === 'conductor-rules') {
           state.conductorRulesLoaded = true;
           sessionState.set(sessionID, state);
         } else if (input.tool === 'task' && !state.conductorRulesLoaded) {
-          auditedCheck(sessionID, 'orchestrator', 'conductor_rules_gate', () => {
-            throw new Error(`❌ ORCHESTRATOR: devi prima caricare Skill('conductor-rules') prima di delegare.`);
-          }, { tool: input.tool });
+          if (await wasConductorRulesLoadedInHistory(sessionID)) {
+            state.conductorRulesLoaded = true;
+            sessionState.set(sessionID, state);
+          } else {
+            auditedCheck(sessionID, 'orchestrator', 'conductor_rules_gate', () => {
+              throw new Error(`❌ ORCHESTRATOR: devi prima caricare Skill('conductor-rules') prima di delegare.`);
+            }, { tool: input.tool });
+          }
         }
       }
 

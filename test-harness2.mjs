@@ -342,6 +342,43 @@ console.log('--- 9. CONDUCTOR-RULES GATE: skill deve essere caricata prima della
     );
   });
 }
+{
+  // Simula riavvio del processo del plugin (es. chiusura/riapertura di OpenCode)
+  // sulla STESSA sessionID: una nuova istanza di DelegationGuard parte con
+  // sessionState (Map in-memory) vuota, ma lo storico messaggi della sessione
+  // (via client.session.messages) contiene già una chiamata a Skill('conductor-rules').
+  // Il gate non deve richiedere di ricaricarla una seconda volta.
+  const restartSessionID = 'ses_orch_gate_restart';
+  const mockClientWithHistory = {
+    tui: { showToast: async () => {} },
+    session: {
+      messages: async ({ path }) => {
+        if (path?.id !== restartSessionID) return { data: [] };
+        return {
+          data: [{
+            info: { id: 'msg_1' },
+            parts: [{
+              type: 'tool', tool: 'skill', callID: 'call_prev',
+              state: { status: 'completed', input: { name: 'conductor-rules' }, output: '', title: '', metadata: {}, time: { start: 0, end: 0 } }
+            }]
+          }]
+        };
+      }
+    }
+  };
+  const guardGateRestart = await DelegationGuard({
+    project: { id: 'test-project-gate-restart' }, client: mockClientWithHistory, $: async () => {},
+    directory: '/home/claude/fake-project-gate-restart', worktree: '/'
+  });
+  const beforeGR = guardGateRestart['tool.execute.before'];
+  await expectPass('dopo riavvio plugin (Map vuota) sulla stessa sessione, storico conferma conductor-rules già caricata', () => {
+    callID++;
+    return beforeGR(
+      { tool: 'task', sessionID: restartSessionID, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - test gate restart', prompt: 'domain:implementation causa root nota, test gate restart' } }
+    );
+  });
+}
 
 console.log(`\n=== RISULTATI: ${pass} passati, ${fail} falliti su ${pass+fail} test ===\n`);
 if (failures.length) {
