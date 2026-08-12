@@ -67,7 +67,7 @@ Every guard rule is implemented as a **pure function**, making the system:
 | 🧭 **Smart Routing** | Domain-based task routing with delegation rules |
 | 🔍 **Secret Detection** | Active redaction of credentials in tool outputs |
 | 📊 **Full Observability** | Structured audit trails, incident tracking, real-time notifications |
-| 🧪 **Comprehensive Testing** | 34 automated scenarios covering all guard behaviors |
+| 🧪 **Comprehensive Testing** | 45 automated scenarios covering all guard behaviors |
 
 ---
 
@@ -246,6 +246,10 @@ The Guard enforces a mandatory delegation sequence:
 
 > **Note:** `verifier` and `doc-writer` may operate autonomously (no preceding `executor` required).
 
+3. **Conductor-rules gate**: the Orchestrator's first `task` (delegation) call is blocked until it has called `skill` with `conductor-rules` in that session (`isOrchestrator`-only — never applies to subagents, to avoid identity confusion where a subagent that loads the Orchestrator's rules starts believing it *is* the Orchestrator). The flag persists in `sessionState` for the rest of the session — not re-required every prompt.
+
+   > 🔁 **Restart-safe:** `sessionState` is an in-memory Map, cleared whenever the plugin process restarts (e.g. closing/reopening OpenCode). If the same session is resumed, the gate checks `client.session.messages()` for a prior `conductor-rules` load in that session's history before blocking, instead of forcing a redundant reload of rules already in context.
+
 ### Routing Guard & Delegation Rules
 
 Every task must declare a domain in the prompt (`domain:<name>`). The Guard verifies the target agent can handle that domain:
@@ -283,6 +287,8 @@ Intercepts write calls and enforces:
 - Enforces per-agent write scope:
   - `sketcher` → only `sketches/`, `mockups/`, `prototypes/`
   - `spiker` → only `spikes/`, `experiments/`, `prototypes/`, `tmp/`, `sandbox/`
+
+**Repeated out-of-scope write escalation:** the first out-of-scope write attempt returns the generic `❌ SCOPE:` error (allows honest self-correction). A **second** attempt at the *identical* normalized path escalates to `❌ ROUTING: ... redelega a executor con domain:implementation` instead of repeating the same block indefinitely. This targets a real misuse pattern: a task mislabeled as `domain:feasibility_spike`/`domain:throwaway_prototype` to route it through `spiker`'s permissive profile (full bash/edit, none of `executor`'s workflow gates) and dodge the stricter `executor` checks — the Guard can't validate that a self-declared domain is *true*, only that writes stay inside the declared agent's scope, so persistence on the same forbidden target is the signal used instead. Tracking is per-session, keyed by `agent::normalizedPath` — an isolated typo on a *different* path never counts against a prior one.
 
 ### Webfetch Guard
 
@@ -470,7 +476,7 @@ Every blocked action displays a real-time error toast in the OpenCode interface,
 
 Check functions are private to the plugin closure — no named exports. Tests verify behavior via the public API (`DelegationGuard` factory) by instantiating the guard with a mock client and simulating tool calls through the `tool.execute.before` hook.
 
-`test-harness2.mjs` is included in this repository and covers **8 main suites**:
+`test-harness2.mjs` is included in this repository and covers **10 main suites**:
 
 1. Routing / domain declaration
 2. Workflow sequence (fix requires diagnosis)
@@ -480,6 +486,8 @@ Check functions are private to the plugin closure — no named exports. Tests ve
 6. Orchestrator tool restrictions
 7. Swarm Mode — same-type parallel OK, cross-type blocked
 8. Orchestrator hijack guard (subagent auto-delegation before crystallization)
+9. Conductor-rules gate (skill must be loaded before first delegation, including restart-safe history check)
+10. Scope violation repeat-target escalation (repeated out-of-scope writes to the same path escalate to an executor redirect)
 
 ### Running Tests
 
