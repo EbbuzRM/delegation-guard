@@ -1195,7 +1195,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
         const exists = input.args?.exists === true || output?.args?.exists === true
         const writeAgent = subagentType || 'unknown'
         auditedCheck(sessionID, writeAgent, 'write_path', () => {
-          checkWritePath(writeAgent, filePath, exists)
+          checkWritePath(writeAgent, filePath, exists, state.scopeViolationTargets)
         }, { filePath, exists })
         return
       }
@@ -1674,7 +1674,8 @@ function createSessionState() {
     delegationStack: /** @type {string[]} */ ([]),
     delegationSequence: /** @type {string[]} */ ([]),
     taskRetries: /** @type {Record<string, number>} */ ({}),
-    conductorRulesLoaded: false
+    conductorRulesLoaded: false,
+    scopeViolationTargets: /** @type {Record<string, number>} */ ({})
   }
 }
 
@@ -2456,6 +2457,46 @@ function checkEditPath(agent, filePath) {
   validatePathZone(agent, filePath, 'edit')
 }
 
+/** Agenti con writeScope ristretto a cartelle throwaway, e il relativo pattern/etichetta. */
+const RESTRICTED_WRITE_SCOPE_AGENTS = {
+  sketcher: { pattern: /^(sketches|mockups|prototypes)\//i, label: 'sketches/, mockups/, prototypes/' },
+  spiker: { pattern: /^(spikes|experiments|prototypes|tmp|sandbox)\//i, label: 'spikes/, experiments/, prototypes/, tmp/, sandbox/' }
+}
+
+/**
+ * Traccia i tentativi ripetuti di un agente a writeScope ristretto di scrivere
+ * FUORI dal proprio scope, sullo STESSO path normalizzato. Alla 2a ripetizione
+ * dello stesso target, sostituisce il generico errore SCOPE con un routing error
+ * più forte — segnale che non si tratta di un vero throwaway/prototipo (un errore
+ * isolato/typo non ripete mai lo stesso identico path due volte), ma di un tentativo
+ * insistito di far passare del lavoro reale attraverso un agente permissivo.
+ *
+ * Validato via simulazione su scenari realistici prima dell'implementazione
+ * (self-correction, typo isolati su path diversi, sessioni lunghe con più spike
+ * separati, evasione via "successo di facciata" tra due tentativi) — 0 falsi
+ * positivi/negativi tranne un caso ambiguo per design (stesso typo esatto ripetuto
+ * 2 volte), accettabile perché il costo del falso positivo è solo un messaggio di
+ * redirect, non un blocco permanente.
+ *
+ * @param {string} agent
+ * @param {string} filePath
+ * @param {Record<string, number>} scopeViolationTargets - state.scopeViolationTargets della sessione
+ * @param {string} baseMessage - messaggio d'errore originale (1° tentativo)
+ * @throws {Error} sempre — messaggio base al 1° tentativo, escalation dal 2°
+ */
+function throwOrEscalateScopeViolation(agent, filePath, scopeViolationTargets, baseMessage) {
+  const key = agent + '::' + normalizePathForCheck(filePath)
+  const count = (scopeViolationTargets[key] || 0) + 1
+  scopeViolationTargets[key] = count
+  if (count >= 2) {
+    throw new Error(
+      `❌ ROUTING: ${agent} ha già tentato ${count} volte di scrivere in "${filePath}" (fuori dal proprio writeScope).\n` +
+      `→ Non è un throwaway/prototipo genuino — redelega a executor con domain:implementation.`
+    )
+  }
+  throw new Error(baseMessage)
+}
+
 /**
  * Check 10+11 — Write path enforcement.
  * Normalizza il path (gestisce backslash Windows, ./ prefisso, ../ traversal)
@@ -2464,36 +2505,41 @@ function checkEditPath(agent, filePath) {
  * @param {string} agent - subagent_type (es. 'executor')
  * @param {string} filePath - path del file target
  * @param {boolean} exists - true se il file esiste già, false se è nuovo
+ * @param {Record<string, number>} [scopeViolationTargets] - state.scopeViolationTargets della sessione (solo per agenti a writeScope ristretto)
  * @throws {Error} se write a file esistente non consentito
  */
-function checkWritePath(agent, filePath, exists) {
+function checkWritePath(agent, filePath, exists, scopeViolationTargets) {
   // FIX (2026-07-25): stesso buco di checkEditPath — mancava lo scan sui pattern
   // sensibili per write.
   checkSensitiveFileAccess(agent, null, filePath, 'write')
-  validatePathZone(agent, filePath, 'write')
+
+  const restriction = RESTRICTED_WRITE_SCOPE_AGENTS[agent]
+
+  try {
+    validatePathZone(agent, filePath, 'write')
+  } catch (err) {
+    if (restriction && scopeViolationTargets) {
+      throwOrEscalateScopeViolation(agent, filePath, scopeViolationTargets, err.message)
+    }
+    throw err
+  }
+
   if (exists && !/\.(log|tmp|bak)$/i.test(filePath)) {
     throw new Error(
       `❌ WRITE: write a file esistente (${filePath}) bloccato — usa "edit" per file esistenti.\n` +
       `→ Eccezioni: *.log, *.tmp, *.bak`
     )
   }
-  if (agent === 'sketcher') {
+
+  if (restriction) {
     // Bug #2 fix: normalizza path (rimuove ./, \ → /) e usa flag /i per case-insensitive
     const normalizedScope = normalizePathForCheck(filePath)
-    if (!/^(sketches|mockups|prototypes)\//i.test(normalizedScope)) {
-      throw new Error(
-        `❌ SCOPE: sketcher può scrivere solo in sketches/, mockups/, prototypes/.\n` +
-        `→ Path: ${filePath}`
-      )
-    }
-  } else if (agent === 'spiker') {
-    // Bug #2 fix: normalizza path (rimuove ./, \ → /) e usa flag /i per case-insensitive
-    const normalizedScope = normalizePathForCheck(filePath)
-    if (!/^(spikes|experiments|prototypes|tmp|sandbox)\//i.test(normalizedScope)) {
-      throw new Error(
-        `❌ SCOPE: spiker può scrivere solo in spikes/, experiments/, prototypes/, tmp/, sandbox/.\n` +
-        `→ Path: ${filePath}`
-      )
+    if (!restriction.pattern.test(normalizedScope)) {
+      const baseMessage = `❌ SCOPE: ${agent} può scrivere solo in ${restriction.label}.\n→ Path: ${filePath}`
+      if (scopeViolationTargets) {
+        throwOrEscalateScopeViolation(agent, filePath, scopeViolationTargets, baseMessage)
+      }
+      throw new Error(baseMessage)
     }
   }
 }

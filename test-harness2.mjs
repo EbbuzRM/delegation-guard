@@ -380,6 +380,64 @@ console.log('--- 9. CONDUCTOR-RULES GATE: skill deve essere caricata prima della
   });
 }
 
+console.log('--- 10. SCOPE VIOLATION REPEAT-TARGET ESCALATION: stesso path fuori scope ripetuto ---');
+{
+  // NOTA: usiamo process.cwd() come project directory (invece di un path fittizio
+  // stile /home/claude/...) e filePath RELATIVI — riflette come funzionano davvero
+  // normalizePathForCheck (strip di un solo "/" iniziale, non del prefisso progetto)
+  // e validatePathZone (containment via path.resolve). Con un project dir fittizio
+  // e filePath assoluti "prefissati", il check SCOPE (che si aspetta "spikes/...")
+  // fallirebbe sempre indipendentemente dallo scope reale, invalidando il test.
+  const guardScope = await DelegationGuard({
+    project: { id: 'test-project-scope-escalate' }, client: mockClient, $: async () => {},
+    directory: process.cwd(), worktree: '/'
+  });
+  const beforeSE = guardScope['tool.execute.before'];
+  const eventSE = guardScope['event'];
+  const orchSessionSE = 'ses_orch_scope_escalate';
+  const subSessionSE = 'ses_sub_scope_escalate';
+
+  // Registra la sessione root come Orchestratore e la sessione figlia come spiker,
+  // via l'event hook session.created — stesso meccanismo di produzione (vedi sezione 9).
+  await eventSE({ event: { type: 'session.created', properties: { sessionID: orchSessionSE, info: { agent: 'orchestrator' } } } });
+  await eventSE({ event: { type: 'session.created', properties: { sessionID: subSessionSE, info: { agent: 'spiker', parentID: orchSessionSE } } } });
+
+  const outOfScopePath = 'src/real-fix.ts';
+
+  await expectBlock('1° tentativo su path fuori scope: errore SCOPE generico, non escalation', () => {
+    callID++;
+    return beforeSE(
+      { tool: 'write', sessionID: subSessionSE, callID: 'call_' + callID, args: { filePath: outOfScopePath, content: 'x' } },
+      { args: { filePath: outOfScopePath, content: 'x' } }
+    );
+  }, 'SCOPE');
+
+  await expectBlock('2° tentativo sullo STESSO path fuori scope: escalation a ROUTING/redelega', () => {
+    callID++;
+    return beforeSE(
+      { tool: 'write', sessionID: subSessionSE, callID: 'call_' + callID, args: { filePath: outOfScopePath, content: 'y' } },
+      { args: { filePath: outOfScopePath, content: 'y' } }
+    );
+  }, 'ROUTING');
+
+  const otherOutOfScopePath = 'src/other-file.ts';
+  await expectBlock('tentativo su un path DIVERSO, mai visto prima: errore SCOPE generico (no escalation prematura)', () => {
+    callID++;
+    return beforeSE(
+      { tool: 'write', sessionID: subSessionSE, callID: 'call_' + callID, args: { filePath: otherOutOfScopePath, content: 'z' } },
+      { args: { filePath: otherOutOfScopePath, content: 'z' } }
+    );
+  }, 'SCOPE');
+
+  await expectPass('scrittura dentro il proprio writeScope resta permessa', () => {
+    callID++;
+    return beforeSE(
+      { tool: 'write', sessionID: subSessionSE, callID: 'call_' + callID, args: { filePath: 'spikes/ok.js', content: 'x' } },
+      { args: { filePath: 'spikes/ok.js', content: 'x' } }
+    );
+  });
+}
+
 console.log(`\n=== RISULTATI: ${pass} passati, ${fail} falliti su ${pass+fail} test ===\n`);
 if (failures.length) {
   console.log('FALLIMENTI:');
