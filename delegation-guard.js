@@ -264,6 +264,14 @@ const shellMutationPatterns = [
   /\bRename-Item\b/i,
   /\bMove-Item\b/i,
   /\bNew-Item\b.*-ItemType\s+File/i,
+  // .NET diretto — bypassa i cmdlet PowerShell "nominati" sopra (Set-Content,
+  // ecc.) chiamando le API .NET File/Directory direttamente. Incidente reale
+  // 2026-08-14: "debugger" (readOnlyDespiteFullBash) ha scritto un file via
+  // [System.IO.File]::WriteAllText() — nessun pattern lo copriva, comando
+  // passato come se fosse read-only. Copre sia il tipo completo che
+  // l'accelerator corto ([IO.File] / [IO.Directory]).
+  /\[(?:System\.IO\.|IO\.)?File\]::(WriteAllText|WriteAllLines|WriteAllBytes|AppendAllText|AppendAllLines|Copy|Move|Delete|Replace|Encrypt)\s*\(/i,
+  /\[(?:System\.IO\.|IO\.)?Directory\]::(CreateDirectory|Delete|Move)\s*\(/i,
   // NOTA: rimosso il pattern generico di redirection (>/>>). Falsi positivi
   // troppo frequenti: qualsiasi script Python/JS che fa parsing di HTML/XML
   // con regex contiene `>` per motivi estranei alla shell (es. `[^>]*>` per

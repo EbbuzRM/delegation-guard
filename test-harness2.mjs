@@ -478,6 +478,66 @@ console.log('--- 11. FASE PRE-DELEGATION: tool "question" (domande interattive) 
   }, 'Delega');
 }
 
+console.log('--- 12. SHELL MUTATION via .NET diretto (bypass dei cmdlet PowerShell nominati) ---');
+{
+  // Incidente reale 2026-08-14: "debugger" (readOnlyDespiteFullBash) ha scritto
+  // un file via [System.IO.File]::WriteAllText() invece di un cmdlet come
+  // Set-Content — nessun pattern lo copriva, comando passato come read-only.
+  //
+  // Istanza dedicata (non la `guard` condivisa di sezioni 1-7 via delegateAndCrystallize):
+  // 'default' accumula decine di deleghe attraverso le sezioni precedenti, e l'anti-loop
+  // saturation guard può silenziosamente bloccare (catch ignorato in delegateAndCrystallize)
+  // la delega a debugger, lasciando currentActiveAgent sull'agente sbagliato — falso
+  // negativo del TEST, non del Guard. Identità via registry (session.created), come
+  // sezione 10, evita del tutto il problema.
+  const guardNet = await DelegationGuard({
+    project: { id: 'test-project-dotnet-mutation' }, client: mockClient, $: async () => {},
+    directory: '/home/claude/fake-project-dotnet-mutation', worktree: '/'
+  });
+  const beforeNet = guardNet['tool.execute.before'];
+  const eventNet = guardNet['event'];
+  const orchSessionNet = 'ses_orch_dotnet_mutation';
+  const subSessionNet = 'ses_sub_dotnet_mutation';
+  await eventNet({ event: { type: 'session.created', properties: { sessionID: orchSessionNet, info: { agent: 'orchestrator' } } } });
+  await eventNet({ event: { type: 'session.created', properties: { sessionID: subSessionNet, info: { agent: 'debugger', parentID: orchSessionNet } } } });
+
+  await expectBlock('.NET File.WriteAllText (System.IO completo) bloccato per debugger', () => {
+    callID++;
+    const command = '[System.IO.File]::WriteAllText("C:\\App\\project\\out.txt", $content)';
+    return beforeNet(
+      { tool: 'bash', sessionID: subSessionNet, callID: 'call_' + callID, args: { command } },
+      { args: { command } }
+    );
+  }, 'SHELL MUTATION');
+
+  await expectBlock('.NET File.AppendAllLines (accelerator [IO.File]) bloccato per debugger', () => {
+    callID++;
+    const command = '[IO.File]::AppendAllLines("C:\\App\\project\\log.txt", $lines)';
+    return beforeNet(
+      { tool: 'bash', sessionID: subSessionNet, callID: 'call_' + callID, args: { command } },
+      { args: { command } }
+    );
+  }, 'SHELL MUTATION');
+
+  await expectBlock('.NET Directory.CreateDirectory bloccato per debugger', () => {
+    callID++;
+    const command = '[System.IO.Directory]::CreateDirectory("C:\\App\\project\\newdir")';
+    return beforeNet(
+      { tool: 'bash', sessionID: subSessionNet, callID: 'call_' + callID, args: { command } },
+      { args: { command } }
+    );
+  }, 'SHELL MUTATION');
+
+  await expectPass('.NET File.ReadAllText resta permesso (sola lettura) per debugger', () => {
+    callID++;
+    const command = '[System.IO.File]::ReadAllText("C:\\App\\project\\in.txt")';
+    return beforeNet(
+      { tool: 'bash', sessionID: subSessionNet, callID: 'call_' + callID, args: { command } },
+      { args: { command } }
+    );
+  });
+}
+
 console.log(`\n=== RISULTATI: ${pass} passati, ${fail} falliti su ${pass+fail} test ===\n`);
 if (failures.length) {
   console.log('FALLIMENTI:');
