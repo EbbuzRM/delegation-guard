@@ -1069,9 +1069,12 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
           // esplicita dell'utente (costo tempo/token). Senza questa aggiunta,
           // durante la fase pre-delegation webfetch veniva comunque bloccato QUI,
           // prima di arrivare al ramo dedicato che lo permette per l'Orchestratore.
+          // 'question' incluso (2026-08-14): è il tool nativo con cui OpenCode fa
+          // domande interattive all'utente — non muta nulla, va sempre permesso,
+          // altrimenti la domanda arriva bloccata come se fosse un tool vietato.
           const allowedTools = ['read', 'grep', 'glob', 'ls', 'cat', 'find',
             'todowrite', 'todoread', 'sequential-thinking_sequentialthinking', 'skill', 'invalid',
-            'webfetch', 'websearch']
+            'webfetch', 'websearch', 'question']
           if (allowedTools.includes(input.tool)) return
           auditedCheck(sessionID, subagentType || 'orchestrator', 'tool_phase', () => {
             throw new Error(`❌ ORCHESTRATOR: ${input.tool} vietato in fase pre-delegation.`)

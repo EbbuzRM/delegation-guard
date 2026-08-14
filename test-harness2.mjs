@@ -438,6 +438,46 @@ console.log('--- 10. SCOPE VIOLATION REPEAT-TARGET ESCALATION: stesso path fuori
   });
 }
 
+console.log('--- 11. FASE PRE-DELEGATION: tool "question" (domande interattive) sempre permesso ---');
+{
+  const guardPreDeleg = await DelegationGuard({
+    project: { id: 'test-project-pre-delegation' }, client: mockClient, $: async () => {},
+    directory: '/home/claude/fake-project-pre-delegation', worktree: '/'
+  });
+  const beforePD = guardPreDeleg['tool.execute.before'];
+  const orchSessionPD = 'ses_orch_pre_delegation';
+
+  // Preload conductor-rules (gate 2.6) sulla sessione dell'Orchestratore.
+  callID++;
+  await beforePD(
+    { tool: 'skill', sessionID: orchSessionPD, callID: 'call_' + callID },
+    { args: { name: 'conductor-rules' } }
+  );
+
+  // Delega a explorer (canPreDelegate: true) → mette l'Orchestratore in fase 'pre-delegation'.
+  callID++;
+  await beforePD(
+    { tool: 'task', sessionID: orchSessionPD, callID: 'call_' + callID },
+    { args: { subagent_type: 'explorer', description: 'domain:exploration - mappa il modulo auth', prompt: 'domain:exploration mappa il modulo auth prima di delegare il fix' } }
+  );
+
+  await expectPass('tool "question" permesso in fase pre-delegation (domanda interattiva all\'utente)', () => {
+    callID++;
+    return beforePD(
+      { tool: 'question', sessionID: orchSessionPD, callID: 'call_' + callID, args: { text: 'Vuoi che proceda con l\'opzione A o B?' } },
+      { args: { text: 'Vuoi che proceda con l\'opzione A o B?' } }
+    );
+  });
+
+  await expectBlock('bash resta vietato in fase pre-delegation (nessun allentamento indesiderato)', () => {
+    callID++;
+    return beforePD(
+      { tool: 'bash', sessionID: orchSessionPD, callID: 'call_' + callID, args: { command: 'ls' } },
+      { args: { command: 'ls' } }
+    );
+  }, 'Delega');
+}
+
 console.log(`\n=== RISULTATI: ${pass} passati, ${fail} falliti su ${pass+fail} test ===\n`);
 if (failures.length) {
   console.log('FALLIMENTI:');
