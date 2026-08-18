@@ -538,6 +538,41 @@ console.log('--- 12. SHELL MUTATION via .NET diretto (bypass dei cmdlet PowerShe
   });
 }
 
+console.log('--- 13. UNKNOWN SUBAGENT_TYPE: delega a un agente non configurato deve bloccare, non passare in silenzio ---');
+{
+  // Incidente reale 2026-08-15: delega a "general" (agente generico nativo di
+  // OpenCode, non presente in guard-config.json) eseguita con ZERO enforcement —
+  // il vecchio codice faceva `return` silenzioso saltando tutti i check.
+  const guardUnknown = await DelegationGuard({
+    project: { id: 'test-project-unknown-agent' }, client: mockClient, $: async () => {},
+    directory: '/home/claude/fake-project-unknown-agent', worktree: '/'
+  });
+  const beforeUA = guardUnknown['tool.execute.before'];
+  const orchSessionUA = 'ses_orch_unknown_agent';
+
+  callID++;
+  await beforeUA(
+    { tool: 'skill', sessionID: orchSessionUA, callID: 'call_' + callID },
+    { args: { name: 'conductor-rules' } }
+  );
+
+  await expectBlock('delega a subagent_type "general" (non configurato) bloccata', () => {
+    callID++;
+    return beforeUA(
+      { tool: 'task', sessionID: orchSessionUA, callID: 'call_' + callID },
+      { args: { subagent_type: 'general', description: 'domain:implementation - fix rapido', prompt: 'domain:implementation causa root nota, fix rapido' } }
+    );
+  }, 'ROUTING');
+
+  await expectPass('task senza subagent_type non genera un blocco custom (OpenCode rifiuta a livello di schema)', () => {
+    callID++;
+    return beforeUA(
+      { tool: 'task', sessionID: orchSessionUA, callID: 'call_' + callID },
+      { args: { description: 'domain:implementation - fix senza target', prompt: 'domain:implementation causa root nota' } }
+    );
+  });
+}
+
 console.log(`\n=== RISULTATI: ${pass} passati, ${fail} falliti su ${pass+fail} test ===\n`);
 if (failures.length) {
   console.log('FALLIMENTI:');

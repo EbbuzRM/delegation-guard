@@ -1232,10 +1232,29 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
           const description = output?.args?.description ?? ""
           const fullText = `${description} ${prompt}`
 
-          if (!targetAgent || !agentProfiles[targetAgent]) {
-            // Cleanup: rimuovi il pending perché il task non verrà processato
-            if (targetAgent) pendingAgentTypes.delete(targetAgent);
+          if (!targetAgent) {
+            // subagent_type del tutto assente: OpenCode stesso rifiuta la tool call
+            // a livello di schema (SchemaError "Missing key at subagent_type") prima
+            // che il task venga processato — nessun blocco necessario qui.
             return
+          }
+          if (!agentProfiles[targetAgent]) {
+            // FIX (2026-08-15): incidente reale — delega a "general" (agente
+            // generico nativo di OpenCode, non presente in guard-config.json)
+            // passava con un semplice `return` silenzioso, SALTANDO tutti i check
+            // sotto (routing, delegation_rules, neverdo, anti_loop, workflow) —
+            // il task veniva eseguito con ZERO enforcement del Guard. A differenza
+            // del caso "subagent_type assente" sopra, qui il valore è valido per lo
+            // schema di OpenCode (quindi la delega VIENE eseguita) ma non
+            // corrisponde a nessun agente configurato — deve essere bloccata, non
+            // lasciata passare in silenzio.
+            pendingAgentTypes.delete(targetAgent);
+            auditedCheck(sessionID, targetAgent, 'unknown_agent', () => {
+              throw new Error(
+                `❌ ROUTING: subagent_type "${targetAgent}" non esiste in guard-config.json — delega vietata.\n` +
+                `→ Agenti validi: ${Object.keys(agentProfiles).sort().join(', ')}`
+              )
+            }, { targetAgent })
           }
           const targetProfile = agentProfiles[targetAgent]
 
