@@ -374,7 +374,7 @@ const SECRET_PATTERNS = [
 /**
  * File di log/lezioni auto-scritti dal Guard o dall'orchestratore.
  * Contengono MENZIONI testuali di path sensibili come esempio storico
- * (es. "File: .ssh/id_rsa, Pattern: ssh_keys" in un log di blocco passato),
+ * (es. "File: cartella .ssh, chiave id_rsa, Pattern: ssh_keys" in un log di blocco passato),
  * non secret reali. Esclusi da checkSecretsInOutput per evitare falsi positivi
  * quando un agente li rilegge (bug 08-08: lessons.md redatto 2 volte per
  * "Generic private key path" pur non contenendo alcuna chiave).
@@ -385,7 +385,17 @@ const SECRET_SCAN_EXCLUDED_FILES = [
   'delegation-guard-runtime.log',
   'guard-debug.jsonl',
   'guard-init.log',
-  'incidents.md'
+  'incidents.md',
+  // File sorgente del Guard stesso (bug 2026-08-15): delegation-guard.js contiene
+  // ESEMPI TESTUALI di path/pattern sensibili nei propri commenti/JSDoc (per
+  // documentare cosa i pattern rilevano) — quegli esempi matchano i pattern che
+  // descrivono, causando la redazione dell'intero file quando un agente lo legge
+  // per diagnosi/review. Nomi specifici del plugin, non generici (niente
+  // "readme.md": in un progetto qualsiasi un README reale potrebbe contenere un
+  // secret vero e non va escluso automaticamente).
+  'delegation-guard.js',
+  'guard-config.json',
+  'test-harness2.mjs'
 ]
 
 function isSecretScanExcluded(filePath) {

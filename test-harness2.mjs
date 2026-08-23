@@ -573,6 +573,48 @@ console.log('--- 13. UNKNOWN SUBAGENT_TYPE: delega a un agente non configurato d
   });
 }
 
+console.log('--- 14. SECRET SCAN: falso positivo su lettura dei file sorgente del Guard ---');
+{
+  // Incidente reale 2026-08-15: delegation-guard.js contiene ESEMPI testuali di
+  // pattern sensibili nei propri commenti (per documentare cosa i pattern
+  // rilevano) — leggerlo triggerava la redazione dell'intero file. Verifica sia
+  // che i file del Guard siano ora esclusi, sia che la detection generica su
+  // ALTRI file NON sia stata indebolita dall'esclusione.
+  const guardSecret = await DelegationGuard({
+    project: { id: 'test-project-secret-scan' }, client: mockClient, $: async () => {},
+    directory: '/home/claude/fake-project-secret-scan', worktree: '/'
+  });
+  const eventSecret = guardSecret['event'];
+  const beforeSecret = guardSecret['tool.execute.before'];
+  const afterSecret = guardSecret['tool.execute.after'];
+  const subSessionSecret = 'ses_sub_secret_scan';
+  await eventSecret({ event: { type: 'session.created', properties: { sessionID: subSessionSecret, info: { agent: 'debugger', parentID: 'ses_orch_secret_scan' } } } });
+  // Cristallizza state.lastAgent='debugger' — tool.execute.after legge SOLO
+  // state.lastAgent (sessionState, popolata da tool.execute.before), non il
+  // subagentRegistry popolato dall'event hook sopra.
+  callID++;
+  await beforeSecret(
+    { tool: 'read', sessionID: subSessionSecret, callID: 'call_' + callID, args: { filePath: '/home/claude/fake-project-secret-scan/README.md' } },
+    { args: { filePath: '/home/claude/fake-project-secret-scan/README.md' } }
+  );
+
+  await expectPass('lettura di delegation-guard.js NON viene redatta (contiene solo esempi testuali)', async () => {
+    const output = { args: { filePath: 'C:\\Users\\test\\.opencode\\plugins\\delegation-guard.js' }, output: 'commento di esempio: cartella .ssh, chiave id_rsa nel path .ssh/id_rsa' };
+    await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
+    if (output.output.includes('REDACTED')) {
+      throw new Error(`atteso contenuto intatto, trovato: ${output.output}`);
+    }
+  });
+
+  await expectPass('lettura di un file NON escluso con un secret reale viene ANCORA redatta (nessuna regressione)', async () => {
+    const output = { args: { filePath: 'C:\\Users\\test\\project\\some-other-file.js' }, output: 'chiave privata: .ssh/id_rsa' };
+    await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
+    if (!output.output.includes('REDACTED')) {
+      throw new Error(`atteso REDACTED, trovato contenuto intatto: ${output.output}`);
+    }
+  });
+}
+
 console.log(`\n=== RISULTATI: ${pass} passati, ${fail} falliti su ${pass+fail} test ===\n`);
 if (failures.length) {
   console.log('FALLIMENTI:');
