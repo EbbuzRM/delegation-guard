@@ -1,11 +1,13 @@
 // @ts-check
 import path from 'node:path'
 import os from 'node:os'
-import { appendFileSync, existsSync, mkdirSync, writeFileSync, readFileSync, statSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, writeFileSync, readFileSync, statSync, renameSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 
 let _projectDirectory = ''
+/** Fallback per il containment check quando _projectDirectory è inaffidabile (vedi validatePathZone). */
+let _worktree = ''
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const runtimeLogPath = path.join(__dirname, 'delegation-guard-runtime.log')
@@ -368,7 +370,14 @@ const SECRET_PATTERNS = [
   { name: 'Supabase token', regex: /sbp_[a-zA-Z0-9]{40,}/g, severity: 'high' },
   { name: 'Generic API key in JSON', regex: /"(apiKey|api_key|password|secret|token)"\s*:\s*"[a-zA-Z0-9_\-]{16,}"/g, severity: 'medium' },
   { name: 'JWT token', regex: /eyJ[a-zA-Z0-9_\-]+\.eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+/g, severity: 'high' },
-  { name: 'Generic private key path', regex: /\.ssh\/id_[a-zA-Z0-9]+/g, severity: 'medium' }
+  { name: 'Generic private key path', regex: /\.ssh\/id_[a-zA-Z0-9]+/g, severity: 'medium' },
+  // Aggiunti 2026-08-15 — coverage mancante segnalata: OpenAI, Slack, Google.
+  // Soglie di lunghezza scelte per evitare falsi positivi su parole/identificatori
+  // comuni che iniziano con lo stesso prefisso (es. "sk-" da solo è troppo corto,
+  // richiede 32+ caratteri come una vera chiave OpenAI classica da 48).
+  { name: 'OpenAI API key', regex: /sk-[a-zA-Z0-9]{32,}/g, severity: 'critical' },
+  { name: 'Slack token', regex: /xox[baprs]-[a-zA-Z0-9-]{10,}/g, severity: 'critical' },
+  { name: 'Google API key', regex: /AIza[0-9A-Za-z_\-]{35}/g, severity: 'critical' }
 ]
 
 /**
@@ -414,11 +423,24 @@ const SENSITIVE_FILE_PATTERNS = [
   // Matcha: .env, .env.local, .env.development, test.env, production.env, config.env, ecc.
   { name: 'env_files', regex: /(^|\/|\\)\.env(\.[a-zA-Z0-9_-]+)?$|\.env$/i, severity: 'critical' },
   { name: 'ssh_keys', regex: /(^|\/|\\)\.ssh[\/\\]id_[a-zA-Z0-9_-]+$/, severity: 'critical' },
+  // FIX (2026-08-15): il pattern sopra richiede il prefisso ".ssh/" — un comando
+  // che costruisce il path in pezzi (es. PowerShell Join-Path, o un token
+  // separato in un glob) può riferirsi al file per nome bare ("id_rsa") senza
+  // mai produrre un token contiguo ".ssh/id_rsa". Whitelist esplicita dei nomi
+  // OpenSSH standard (non un generico "id_*" — "id_token" da solo è un termine
+  // OIDC/OAuth comunissimo, bloccarlo genererebbe falsi positivi costanti).
+  { name: 'ssh_key_bare_filename', regex: /(^|\/|\\)id_(rsa|dsa|ecdsa|ed25519(_sk)?|xmss)(\.pub)?([\/\\]|$)/i, severity: 'critical' },
   { name: 'ssh_private_key_path', regex: /(^|\/|\\)\.ssh[\/\\][^\/\\]+\.pem$/, severity: 'critical' },
   { name: 'aws_credentials', regex: /(^|\/|\\)\.aws[\/\\](credentials|config)$/i, severity: 'critical' },
   { name: 'gcp_credentials', regex: /(^|\/|\\)\.gcp[\/\\](credentials|application_default_credentials\.json)$/i, severity: 'critical' },
   { name: 'azure_credentials', regex: /(^|\/|\\)\.azure[\/\\][^\/\\]*credentials/i, severity: 'critical' },
-  { name: 'secrets_directory', regex: /(^|\/|\\)(secrets|credentials|private)[\/\\]/i, severity: 'high' },
+  // FIX (2026-08-15): richiedeva un separatore DOPO "secrets|credentials|private"
+  // (solo uso come cartella) — un file bare chiamato esattamente "credentials",
+  // "secrets" o "credentials.json" (nessuna cartella genitrice nel path/pattern
+  // glob) non veniva mai catturato. Ora matcha anche a fine stringa o con
+  // un'estensione, restando ancorato a un confine di path prima del nome
+  // (niente match parziale tipo "credentialsfile.txt" o "secretsauce.js").
+  { name: 'secrets_directory', regex: /(^|\/|\\)(secrets|credentials|private)(\.[a-zA-Z0-9]+)?([\/\\]|$)/i, severity: 'high' },
   { name: 'pem_certificates', regex: /\.(pem|key|p12|pfx|jks)$/i, severity: 'high' },
   { name: 'netrc', regex: /(^|\/|\\)\.netrc$/i, severity: 'high' },
   { name: 'git_credentials', regex: /(^|\/|\\)\.git-credentials$/i, severity: 'high' },
@@ -693,6 +715,7 @@ function checkDelegationLoop(currentStack, targetAgent) {
 /** @type {Plugin} */
 export const DelegationGuard = async ({ project, client, $, directory, worktree }) => {
   _projectDirectory = directory || '';
+  _worktree = worktree || '';
   try {
     runtimeLog(`DelegationGuard factory called: project=${project ? 'yes' : 'no'}, client=${client ? 'yes' : 'no'}, directory=${directory || ''}, worktree=${worktree || ''}`)
   // INIT LOG: Conferma che il plugin viene caricato
@@ -947,12 +970,34 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
       } catch (e) { /* Silently fail */ }
 
       // 1. Recupero Stato (In-Memory Map)
+      // FIX (2026-08-15): era FIFO puro (evict per ordine di inserimento), non LRU —
+      // con 100 sessioni accumulate, la PRIMA creata veniva evitta anche se fosse
+      // l'Orchestratore ancora attivo (sessione lunga, poche tool call dirette
+      // perché delega quasi tutto), perdendo conductorRulesLoaded/lastAgent e
+      // ribloccando la delega successiva. Ora: (a) ogni accesso re-inserisce la
+      // chiave in coda alla Map — l'ordine di inserimento diventa ordine LRU reale,
+      // quindi l'eviction colpisce la sessione INATTIVA da più tempo, non la più
+      // vecchia; (b) l'Orchestratore non viene MAI evitto, a prescindere dal suo
+      // ordine LRU — è l'unica sessione la cui perdita di stato blocca l'intero
+      // flusso di delega.
       let state = sessionState.get(sessionID);
-      if (!state) {
+      if (state) {
+        sessionState.delete(sessionID);
+        sessionState.set(sessionID, state);
+      } else {
         if (sessionState.size >= MAX_SESSIONS) {
-          const oldestKey = sessionState.keys().next().value;
-          sessionState.delete(oldestKey);
-          runtimeLog(`MAX_SESSIONS: evicted oldest session ${oldestKey}`);
+          let evicted = false;
+          for (const key of sessionState.keys()) {
+            if (key === orchestratorSessionID) continue;
+            sessionState.delete(key);
+            runtimeLog(`MAX_SESSIONS: evicted LRU session ${key}`);
+            evicted = true;
+            break;
+          }
+          if (!evicted) {
+            // Solo l'Orchestratore in Map (caso limite) — nessun'altra sessione da evittare.
+            runtimeLog(`MAX_SESSIONS: nessuna sessione evittabile (solo Orchestratore presente).`);
+          }
         }
         state = createSessionState();
         sessionState.set(sessionID, state);
@@ -1601,6 +1646,22 @@ let currentAuditLogDir = path.join(__dirname, '.planning', 'audit')
  * @param {string} agent 
  * @param {Record<string, any>} details 
  */
+/**
+ * Sanitizza testo prima di interpolarlo in una riga di INCIDENTS.md/LESSONS.md
+ * (entrambi file markdown in append). Senza questo, un valore attaccante-
+ * controllato (es. subagent_type in un errore ROUTING, o un comando bash
+ * troncato in un errore SHELL MUTATION) contenente `\n### [INC-9999] ...`
+ * può iniettare una entry falsa nell'audit trail — CR/LF sono l'unico modo
+ * per far iniziare una nuova riga markdown, quindi rimuoverli neutralizza
+ * l'injection indipendentemente dal contenuto del resto della stringa.
+ * @param {unknown} value
+ * @returns {string}
+ */
+function sanitizeForMarkdownLog(value) {
+  const text = value === null || value === undefined ? '' : String(value)
+  return text.replace(/[\r\n]+/g, ' ⏎ ')
+}
+
 function handleDeniedEvent(agent, details) {
   try {
     if (!_projectDirectory) {
@@ -1633,25 +1694,38 @@ function handleDeniedEvent(agent, details) {
 
     metrics.total_incidents++;
     const incidentId = `INC-${metrics.total_incidents.toString().padStart(4, '0')}`;
-    const checkName = details.check || 'unknown_check';
+    // Sanitizzati: agent, checkName e details.error possono contenere testo
+    // attaccante-controllato (es. subagent_type arbitrario, comando bash
+    // troncato) — senza questo un CR/LF al loro interno può forgiare una
+    // entry falsa nel log di audit (vedi sanitizeForMarkdownLog).
+    const checkName = sanitizeForMarkdownLog(details.check || 'unknown_check');
+    const safeAgent = sanitizeForMarkdownLog(agent);
+    const safeError = sanitizeForMarkdownLog(details.error || 'Nessun dettaglio fornito');
     const now = new Date();
     const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-    
-    const incidentEntry = `\n### [${incidentId}] [${checkName}] | ${dateStr} | ${agent} | Stato: bloccato | ${details.error || 'Nessun dettaglio fornito'}\n`;
-    
+
+    const incidentEntry = `\n### [${incidentId}] [${checkName}] | ${dateStr} | ${safeAgent} | Stato: bloccato | ${safeError}\n`;
+
     appendFileSync(incidentsPath, incidentEntry, 'utf8');
 
-    const lessonKey = `${agent}:${checkName}`;
+    const lessonKey = `${agent}:${details.check || 'unknown_check'}`;
     metrics.counts[lessonKey] = (metrics.counts[lessonKey] || 0) + 1;
-    
+
     if (metrics.counts[lessonKey] === 2 && !metrics.lessons_written[lessonKey]) {
-      const synthesis = details.error ? details.error.replace(/^❌ [^:]+: /, '') : 'Regola di sicurezza violata';
-      const lessonEntry = `- [${dateStr}] ${agent} ha tentato di ${checkName} $\rightarrow$ ${synthesis}\n`;
+      const synthesis = safeError.replace(/^❌ [^:]+: /, '');
+      const lessonEntry = `- [${dateStr}] ${safeAgent} ha tentato di ${checkName} $\rightarrow$ ${synthesis}\n`;
       appendFileSync(lessonsPath, lessonEntry, 'utf8');
       metrics.lessons_written[lessonKey] = true;
     }
 
-    writeFileSync(metricsPath, JSON.stringify(metrics, null, 2), 'utf8');
+    // Scrittura atomica (temp file + rename) invece di writeFileSync diretta.
+    // Non elimina il read-modify-write race se OpenCode dovesse eseguire il
+    // plugin in processi separati concorrenti sullo stesso progetto (non
+    // verificabile da qui) — ma evita che un lettore concorrente veda un JSON
+    // parzialmente scritto/corrotto a metà di un rename non atomico.
+    const metricsTmpPath = `${metricsPath}.tmp-${process.pid}-${Date.now()}`;
+    writeFileSync(metricsTmpPath, JSON.stringify(metrics, null, 2), 'utf8');
+    renameSync(metricsTmpPath, metricsPath);
   } catch (e) {
     runtimeLog(`Denied event persistence failed: ${e.message}`);
   }
@@ -2457,17 +2531,36 @@ function validatePathZone(agent, filePath, opType) {
   if (/^(node_modules|\.git|dist|build)\//i.test(normalized)) {
     throw new Error(`❌ PATH: ${opType} in ${filePath} bloccato (zona vietata).`)
   }
-  // Check containment nel progetto (skip se _projectDirectory non affidabile).
-  // OpenCode a volte passa directory=plugins\ come project directory (vedi sessione 2026-07-12),
-  // quindi skippa il check se _projectDirectory è vuoto, dentro .opencode, o dentro plugins.
-  if (_projectDirectory && 
-      !_projectDirectory.endsWith(path.sep + '.opencode') && 
-      !_projectDirectory.includes(path.sep + '.opencode' + path.sep) &&
-      !_projectDirectory.endsWith(path.sep + 'plugins') &&
-      !_projectDirectory.includes(path.sep + 'plugins' + path.sep)) {
+  // FIX (2026-08-15): l'audit trail del Guard (.planning/audit/*.jsonl,
+  // .planning/INCIDENTS.md, .opencode/metrics_count.json) non era in nessuna
+  // zona vietata — qualsiasi agente con edit/write nel progetto (es. executor,
+  // writeScope 'all') poteva modificare o cancellare il proprio audit trail.
+  // NOTA: .planning/ nel suo complesso resta scrivibile (explorer ha
+  // writeScope 'planning' per design), solo audit/ e INCIDENTS.md sono protetti.
+  if (/^\.planning\/audit\//i.test(normalized) ||
+      /^\.planning\/incidents\.md$/i.test(normalized) ||
+      /^\.opencode\/metrics_count\.json$/i.test(normalized)) {
+    throw new Error(`❌ PATH: ${opType} in ${filePath} bloccato — audit trail del Guard, non modificabile da nessun agente.`)
+  }
+  // Check containment nel progetto. OpenCode a volte passa directory=plugins\
+  // come project directory (vedi sessione 2026-07-12) — _projectDirectory in quel
+  // caso non è affidabile come radice di containment.
+  //
+  // FIX (2026-08-15): il vecchio codice SALTAVA COMPLETAMENTE il containment
+  // quando _projectDirectory era inaffidabile — nessun altro check qui ferma un
+  // path assoluto fuori progetto (il check "PATH TRAVERSAL" sopra intercetta solo
+  // "../" iniziali, non un path assoluto altrove), quindi in quello scenario
+  // edit/write su QUALSIASI file del filesystem passava senza alcun blocco.
+  // Ora, se _projectDirectory è inaffidabile, si usa `worktree` (passato dalla
+  // factory OpenCode, tipicamente la radice reale del git worktree) come radice
+  // di fallback prima di arrendersi allo skip totale.
+  const projectRoot = isReliableProjectRoot(_projectDirectory)
+    ? _projectDirectory
+    : (isReliableProjectRoot(_worktree) ? _worktree : '')
+  if (projectRoot) {
     const resolvedPath = path.resolve(filePath);
-    const resolvedProject = path.resolve(_projectDirectory);
-    if (!resolvedPath.startsWith(resolvedProject + path.sep) && 
+    const resolvedProject = path.resolve(projectRoot);
+    if (!resolvedPath.startsWith(resolvedProject + path.sep) &&
         resolvedPath !== resolvedProject) {
       throw new Error(
         `❌ PATH OUT OF PROJECT: ${filePath} è fuori dalla directory del progetto.\n` +
@@ -2477,6 +2570,21 @@ function validatePathZone(agent, filePath, opType) {
       );
     }
   }
+}
+
+/**
+ * Un candidato a radice di progetto è "affidabile" se non è vuoto e non punta
+ * dentro `.opencode` o `plugins` — gli stessi due contesti in cui OpenCode è
+ * noto passare la directory sbagliata (vedi commento in validatePathZone).
+ * @param {string} dir
+ * @returns {boolean}
+ */
+function isReliableProjectRoot(dir) {
+  if (!dir) return false
+  return !dir.endsWith(path.sep + '.opencode') &&
+    !dir.includes(path.sep + '.opencode' + path.sep) &&
+    !dir.endsWith(path.sep + 'plugins') &&
+    !dir.includes(path.sep + 'plugins' + path.sep)
 }
 
 /**

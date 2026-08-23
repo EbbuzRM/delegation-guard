@@ -1,4 +1,6 @@
 import { DelegationGuard } from './delegation-guard.js';
+import { readFileSync, existsSync, rmSync } from 'node:fs';
+import path from 'node:path';
 
 const mockClient = { tui: { showToast: async () => {} } };
 const guard = await DelegationGuard({
@@ -613,6 +615,204 @@ console.log('--- 14. SECRET SCAN: falso positivo su lettura dei file sorgente de
       throw new Error(`atteso REDACTED, trovato contenuto intatto: ${output.output}`);
     }
   });
+}
+
+console.log('--- 15. PATH TRAVERSAL BYPASS: fallback su worktree quando directory è inaffidabile ---');
+{
+  // Incidente reale: quando `directory` finisce dentro .opencode/plugins (bug
+  // OpenCode noto), il vecchio codice saltava TUTTO il containment check —
+  // nessun altro check ferma un path assoluto fuori progetto. Ora usa `worktree`
+  // come radice di fallback prima di arrendersi allo skip totale.
+  const guardTraversal = await DelegationGuard({
+    project: { id: 'test-project-traversal' }, client: mockClient, $: async () => {},
+    directory: 'C:\\Users\\test\\.opencode\\plugins', // inaffidabile di proposito
+    worktree: 'C:\\Users\\test\\real-project' // fallback affidabile
+  });
+  const beforeTrav = guardTraversal['tool.execute.before'];
+  const eventTrav = guardTraversal['event'];
+  const subSessionTrav = 'ses_sub_traversal';
+  await eventTrav({ event: { type: 'session.created', properties: { sessionID: subSessionTrav, info: { agent: 'executor', parentID: 'ses_orch_traversal' } } } });
+
+  await expectBlock('write fuori dal worktree di fallback viene bloccata (era: nessun blocco)', () => {
+    callID++;
+    const filePath = 'C:\\Windows\\System32\\evil.txt';
+    return beforeTrav(
+      { tool: 'write', sessionID: subSessionTrav, callID: 'call_' + callID, args: { filePath, content: 'x' } },
+      { args: { filePath, content: 'x' } }
+    );
+  }, 'PATH OUT OF PROJECT');
+
+  await expectPass('write dentro il worktree di fallback resta permessa', () => {
+    callID++;
+    const filePath = 'C:\\Users\\test\\real-project\\src\\ok.txt';
+    return beforeTrav(
+      { tool: 'write', sessionID: subSessionTrav, callID: 'call_' + callID, args: { filePath, content: 'x' } },
+      { args: { filePath, content: 'x' } }
+    );
+  });
+}
+
+console.log('--- 16. INCIDENTS.md INJECTION: newline in un errore non deve forgiare entry finte ---');
+{
+  const injectionProjectDir = path.join(process.cwd(), '.tmp-test-incidents-injection');
+  if (existsSync(injectionProjectDir)) rmSync(injectionProjectDir, { recursive: true, force: true });
+  const guardInj = await DelegationGuard({
+    project: { id: 'test-project-injection' }, client: mockClient, $: async () => {},
+    directory: injectionProjectDir, worktree: '/'
+  });
+  const beforeInj = guardInj['tool.execute.before'];
+  const orchSessionInj = 'ses_orch_injection';
+  callID++;
+  await beforeInj(
+    { tool: 'skill', sessionID: orchSessionInj, callID: 'call_' + callID },
+    { args: { name: 'conductor-rules' } }
+  );
+
+  // subagent_type stesso è il vettore: finisce grezzo nell'errore ROUTING (fix #13)
+  // e quindi in INCIDENTS.md — un \n seguito da una fake entry markdown, se non
+  // sanitizzato, apparirebbe come una entry di audit reale e distinta.
+  const maliciousAgent = 'evil\n### [INC-9999] [fake_check] | 2020-01-01 | fake-agent | Stato: bloccato | ENTRY FALSA INIETTATA';
+  await expectBlock('delega con subagent_type malevolo viene comunque bloccata (routing)', () => {
+    callID++;
+    return beforeInj(
+      { tool: 'task', sessionID: orchSessionInj, callID: 'call_' + callID },
+      { args: { subagent_type: maliciousAgent, description: 'domain:implementation - test injection', prompt: 'domain:implementation causa root nota, test injection' } }
+    );
+  }, 'ROUTING');
+
+  const incidentsPath = path.join(injectionProjectDir, '.planning', 'INCIDENTS.md');
+  await expectPass('INCIDENTS.md non contiene una entry INC-9999 iniettata (solo l\'entry reale)', () => {
+    if (!existsSync(incidentsPath)) throw new Error('INCIDENTS.md non è stato scritto');
+    const content = readFileSync(incidentsPath, 'utf8');
+    // "INC-9999" come TESTO INERTE dentro l'unica entry reale è atteso e corretto
+    // (prova che il payload non ha creato una nuova riga) — il check vero è che
+    // esista UNA SOLA riga che inizia con "### [INC-", non l'assenza della
+    // sottostringa (che comparirebbe comunque, sanitizzata, dentro l'entry reale).
+    const incidentHeaders = content.match(/^### \[INC-/gm) || [];
+    if (incidentHeaders.length !== 1) {
+      throw new Error(`attesa 1 sola entry reale (l'injection avrebbe creato una 2a riga "### [INC-9999]"), trovate ${incidentHeaders.length}: ${content}`);
+    }
+  });
+  rmSync(injectionProjectDir, { recursive: true, force: true });
+}
+
+console.log('--- 17. AUDIT DIR PROTETTA: .planning/audit, INCIDENTS.md, metrics_count.json non modificabili ---');
+{
+  // Istanza dedicata con directory=process.cwd(): la `guard` condivisa risolve i
+  // path relativi contro il process.cwd() reale, non contro il suo fake project
+  // dir — con quella, un path relativo qui darebbe sempre PATH OUT OF PROJECT
+  // indipendentemente dal fix in test (stesso gotcha della sezione 12).
+  const guardAudit = await DelegationGuard({
+    project: { id: 'test-project-audit-dir' }, client: mockClient, $: async () => {},
+    directory: process.cwd(), worktree: '/'
+  });
+  const beforeAudit = guardAudit['tool.execute.before'];
+  const eventAudit = guardAudit['event'];
+  const execSession = 'ses_sub_audit_executor';
+  const explorerSession = 'ses_sub_audit_explorer';
+  await eventAudit({ event: { type: 'session.created', properties: { sessionID: execSession, info: { agent: 'executor', parentID: 'ses_orch_audit' } } } });
+  await eventAudit({ event: { type: 'session.created', properties: { sessionID: explorerSession, info: { agent: 'explorer', parentID: 'ses_orch_audit' } } } });
+  function callAudit(tool, sessionID, args) {
+    callID++;
+    return beforeAudit({ tool, sessionID, callID: 'call_' + callID, args }, { args });
+  }
+
+  await expectBlock('write su .planning/audit/*.jsonl bloccata', () =>
+    callAudit('write', execSession, { filePath: '.planning/audit/audit-2026-01-01.jsonl', content: '{}' }), 'audit trail');
+  await expectBlock('write su .planning/INCIDENTS.md bloccata', () =>
+    callAudit('write', execSession, { filePath: '.planning/INCIDENTS.md', content: 'x' }), 'audit trail');
+  await expectBlock('write su .opencode/metrics_count.json bloccata', () =>
+    callAudit('write', execSession, { filePath: '.opencode/metrics_count.json', content: '{}' }), 'audit trail');
+
+  // Regressione: .planning/ nel suo complesso NON deve diventare vietata —
+  // explorer ha legittimamente writeScope 'planning'.
+  await expectPass('write su .planning/altro-file.md (non audit) resta permessa per explorer', () =>
+    callAudit('write', explorerSession, { filePath: '.planning/analysis-note.md', content: 'x' }));
+}
+
+console.log('--- 18. MAX_SESSIONS LRU: l\'Orchestratore non viene evitto anche oltre il limite ---');
+{
+  const guardLru = await DelegationGuard({
+    project: { id: 'test-project-lru' }, client: mockClient, $: async () => {},
+    directory: '/home/claude/fake-project-lru', worktree: '/'
+  });
+  const beforeLru = guardLru['tool.execute.before'];
+  const eventLru = guardLru['event'];
+  const orchSessionLru = 'ses_orch_lru';
+  await eventLru({ event: { type: 'session.created', properties: { sessionID: orchSessionLru, info: { agent: 'orchestrator' } } } });
+  callID++;
+  await beforeLru(
+    { tool: 'skill', sessionID: orchSessionLru, callID: 'call_' + callID },
+    { args: { name: 'conductor-rules' } }
+  );
+
+  // Riempie la Map ben oltre MAX_SESSIONS (100) con altre sessioni innocue —
+  // registrate come subagent (verifier) via l'event hook, altrimenti senza
+  // identità nota vengono scambiate per l'Orchestratore stesso (self-healing)
+  // e bloccate su 'read' diretto.
+  for (let i = 0; i < 120; i++) {
+    const fillerSession = `ses_filler_${i}`;
+    await eventLru({ event: { type: 'session.created', properties: { sessionID: fillerSession, info: { agent: 'verifier', parentID: orchSessionLru } } } });
+    callID++;
+    await beforeLru(
+      { tool: 'read', sessionID: fillerSession, callID: 'call_' + callID, args: { filePath: `/home/claude/fake-project-lru/f${i}.txt` } },
+      { args: { filePath: `/home/claude/fake-project-lru/f${i}.txt` } }
+    );
+  }
+
+  await expectPass('l\'Orchestratore delega ancora senza dover ricaricare conductor-rules dopo 120 sessioni', () => {
+    callID++;
+    return beforeLru(
+      { tool: 'task', sessionID: orchSessionLru, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - test LRU', prompt: 'domain:implementation causa root nota, test LRU' } }
+    );
+  });
+}
+
+console.log('--- 19. SECRET PATTERNS: coverage OpenAI / Slack / Google ---');
+{
+  const guardCoverage = await DelegationGuard({
+    project: { id: 'test-project-secret-coverage' }, client: mockClient, $: async () => {},
+    directory: '/home/claude/fake-project-secret-coverage', worktree: '/'
+  });
+  const eventCov = guardCoverage['event'];
+  const beforeCov = guardCoverage['tool.execute.before'];
+  const afterCov = guardCoverage['tool.execute.after'];
+  const subSessionCov = 'ses_sub_secret_coverage';
+  await eventCov({ event: { type: 'session.created', properties: { sessionID: subSessionCov, info: { agent: 'debugger', parentID: 'ses_orch_secret_coverage' } } } });
+  callID++;
+  await beforeCov(
+    { tool: 'read', sessionID: subSessionCov, callID: 'call_' + callID, args: { filePath: '/home/claude/fake-project-secret-coverage/README.md' } },
+    { args: { filePath: '/home/claude/fake-project-secret-coverage/README.md' } }
+  );
+
+  const cases = [
+    ['OpenAI', 'sk-' + 'a'.repeat(48)],
+    ['Slack', 'xoxb-' + 'f'.repeat(20)], // forma non realistica di proposito — evita il push protection scanner di GitHub
+    ['Google', 'AIza' + 'S'.repeat(35)],
+  ];
+  for (const [name, secret] of cases) {
+    await expectPass(`chiave ${name} nell'output viene redatta`, async () => {
+      const output = { args: { filePath: '/home/claude/fake-project-secret-coverage/config.txt' }, output: `valore: ${secret}` };
+      await afterCov({ tool: 'read', sessionID: subSessionCov }, output);
+      if (!output.output.includes('REDACTED')) {
+        throw new Error(`atteso REDACTED per ${name}, trovato: ${output.output}`);
+      }
+    });
+  }
+}
+
+console.log('--- 20. SECRETS SENZA SLASH: nomi file bare (credentials, id_rsa) ---');
+{
+  const sess = await delegateAndCrystallize('executor', 'domain:implementation - test bare secrets', 'domain:implementation causa root nota, test bare secrets');
+  await expectBlock('lettura di un file chiamato esattamente "credentials" bloccata', () =>
+    call('read', sess, { filePath: 'credentials' }));
+  await expectBlock('lettura di "id_rsa" bare (nessun prefisso .ssh/) bloccata', () =>
+    call('read', sess, { filePath: 'id_rsa' }));
+  await expectPass('lettura di "credentialsfile.txt" NON bloccata (nessun falso positivo)', () =>
+    call('read', sess, { filePath: 'credentialsfile.txt' }));
+  await expectPass('lettura di "id_token" (termine OIDC comune) NON bloccata', () =>
+    call('read', sess, { filePath: 'id_token' }));
 }
 
 console.log(`\n=== RISULTATI: ${pass} passati, ${fail} falliti su ${pass+fail} test ===\n`);
