@@ -216,6 +216,18 @@ function isVerificationCycleCall(lastAgent, targetAgent) {
 const MAX_SESSIONS = 100
 
 /**
+ * Tool che l'Orchestratore non può MAI usare direttamente, a prescindere da fase
+ * o identità — deve sempre delegare. Fonte unica condivisa da check 2.5 (blocco
+ * assoluto) e check 5 (fase pre-delegation, riga ~1138): prima erano due liste
+ * separate (una allowlist fissa nel check 5) — un tool MCP dinamico non
+ * enumerato in nessuna delle due (es. `supabase_apply_migration`, o qualsiasi
+ * `mcp__*`) veniva bloccato in fase pre-delegation anche se legittimo, perché
+ * l'allowlist non poteva conoscere in anticipo ogni tool MCP configurabile.
+ * @type {string[]}
+ */
+const FORBIDDEN_ORCHESTRATOR_TOOLS = ['glob', 'grep', 'read', 'sequential-thinking_sequentialthinking', 'bash', 'edit', 'write']
+
+/**
  * Ritorna un timestamp ISO 8601 in tempo locale (es. YYYY-MM-DDTHH:mm:ss.sss+HH:MM)
  * @returns {string}
  */
@@ -1053,8 +1065,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
         // fallback (currentActiveAgent), ereditando i permessi bash/scrittura dell'ULTIMO
         // agente delegato (es. executor, bashAllowlist:["*"]) invece di essere bloccato
         // come dovrebbe essere sempre per l'Orchestratore.
-        const forbiddenOrchestratorTools = ['glob', 'grep', 'read', 'sequential-thinking_sequentialthinking', 'bash', 'edit', 'write'];
-        if (forbiddenOrchestratorTools.includes(input.tool)) {
+        if (FORBIDDEN_ORCHESTRATOR_TOOLS.includes(input.tool)) {
           auditedCheck(sessionID, 'orchestrator', 'orchestrator_direct_tool', () => {
             throw new Error(`Delega invece di usare ${input.tool} direttamente.`);
           }, { tool: input.tool });
@@ -1126,19 +1137,18 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
             sessionState.set(sessionID, state)
           }
         } else {
-          // webfetch/websearch inclusi (2026-07-27): l'Orchestratore può cercare/
-          // consultare direttamente per raccogliere contesto prima di delegare,
-          // invece di sprecare un intero subagent per una singola ricerca — scelta
-          // esplicita dell'utente (costo tempo/token). Senza questa aggiunta,
-          // durante la fase pre-delegation webfetch veniva comunque bloccato QUI,
-          // prima di arrivare al ramo dedicato che lo permette per l'Orchestratore.
-          // 'question' incluso (2026-08-14): è il tool nativo con cui OpenCode fa
-          // domande interattive all'utente — non muta nulla, va sempre permesso,
-          // altrimenti la domanda arriva bloccata come se fosse un tool vietato.
-          const allowedTools = ['read', 'grep', 'glob', 'ls', 'cat', 'find',
-            'todowrite', 'todoread', 'sequential-thinking_sequentialthinking', 'skill', 'invalid',
-            'webfetch', 'websearch', 'question']
-          if (allowedTools.includes(input.tool)) return
+          // FIX (2026-08-25): era un'ALLOWLIST fissa — qualsiasi tool MCP dinamico
+          // non enumerato (es. supabase_apply_migration, o qualsiasi mcp__*) veniva
+          // bloccato in fase pre-delegation anche se legittimo, perché l'allowlist
+          // non può conoscere in anticipo ogni tool MCP configurabile. read/grep/
+          // glob/bash/edit/write/sequential-thinking sono GIÀ bloccati per
+          // l'Orchestratore incondizionatamente dal check 2.5 sopra (che gira
+          // PRIMA di questo, quindi qui non li rivediamo mai) — usando la stessa
+          // lista condivisa (FORBIDDEN_ORCHESTRATOR_TOOLS) come DENYLIST invece di
+          // riscrivere un'allowlist separata, qualsiasi altro tool passa, incluso
+          // un tool MCP mai visto prima (webfetch/websearch/question inclusi,
+          // 2026-07-27/2026-08-14 — l'Orchestratore può usarli direttamente).
+          if (!FORBIDDEN_ORCHESTRATOR_TOOLS.includes(input.tool)) return
           auditedCheck(sessionID, subagentType || 'orchestrator', 'tool_phase', () => {
             throw new Error(`❌ ORCHESTRATOR: ${input.tool} vietato in fase pre-delegation.`)
           }, { tool: input.tool })

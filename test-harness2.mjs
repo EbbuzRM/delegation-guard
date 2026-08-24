@@ -478,6 +478,21 @@ console.log('--- 11. FASE PRE-DELEGATION: tool "question" (domande interattive) 
       { args: { command: 'ls' } }
     );
   }, 'Delega');
+
+  // Incidente reale 2026-08-25: l'Orchestratore, dopo aver delegato a explorer
+  // (canPreDelegate: true → fase pre-delegation) per farsi riportare il contenuto
+  // di un file, tentava di usare il proprio tool MCP esclusivo
+  // supabase_apply_migration — bloccato perché non enumerato nella vecchia
+  // allowlist fissa. Nessun tool MCP dinamico può essere enumerato in anticipo,
+  // quindi ora la fase pre-delegation è una DENYLIST (stessi tool sempre vietati
+  // all'Orchestratore) invece di un'allowlist.
+  await expectPass('tool MCP dinamico mai visto prima (es. supabase_apply_migration) permesso in fase pre-delegation', () => {
+    callID++;
+    return beforePD(
+      { tool: 'supabase_apply_migration', sessionID: orchSessionPD, callID: 'call_' + callID, args: { project_id: 'x', name: 'y', query: 'SELECT 1;' } },
+      { args: { project_id: 'x', name: 'y', query: 'SELECT 1;' } }
+    );
+  });
 }
 
 console.log('--- 12. SHELL MUTATION via .NET diretto (bypass dei cmdlet PowerShell nominati) ---');
