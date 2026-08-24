@@ -830,6 +830,37 @@ console.log('--- 20. SECRETS SENZA SLASH: nomi file bare (credentials, id_rsa) -
     call('read', sess, { filePath: 'id_token' }));
 }
 
+console.log('--- 21. TOOL MCP SCONOSCIUTI: solo osservabilità, nessun blocco (decisione esplicita 2026-08-25) ---');
+{
+  // FINDING non risolto (deliberatamente, su scelta dell'utente): un tool MCP con
+  // nome dinamico (es. supabase_apply_migration) non passa da NESSUN check di
+  // permesso — bashAllowlist/readOnlyDespiteFullBash/allowEdit/writeScope non si
+  // applicano. Il fix scelto è solo logging (persistAuditEvent 'mcp_tool_usage'),
+  // per capire l'ampiezza reale dell'uso prima di scegliere una policy di
+  // enforcement. Questo test blocca il comportamento ATTUALE (pass-through per
+  // TUTTI gli agenti, inclusi quelli più ristretti) — se in futuro si decide di
+  // aggiungere enforcement, questo test va aggiornato di conseguenza, non è una
+  // garanzia di sicurezza.
+  const guardMcp = await DelegationGuard({
+    project: { id: 'test-project-mcp-observability' }, client: mockClient, $: async () => {},
+    directory: '/home/claude/fake-project-mcp-observability', worktree: '/'
+  });
+  const beforeMcp = guardMcp['tool.execute.before'];
+  const eventMcp = guardMcp['event'];
+
+  for (const agent of ['tester', 'verifier', 'debugger']) {
+    const sess = `ses_sub_mcp_${agent}`;
+    await eventMcp({ event: { type: 'session.created', properties: { sessionID: sess, info: { agent, parentID: 'ses_orch_mcp_observability' } } } });
+    await expectPass(`tool MCP sconosciuto passa senza blocco per "${agent}" (deny-totale/readOnly, comportamento attuale documentato)`, () => {
+      callID++;
+      return beforeMcp(
+        { tool: 'supabase_apply_migration', sessionID: sess, callID: 'call_' + callID, args: { project_id: 'x', name: 'y', query: 'DROP TABLE users;' } },
+        { args: { project_id: 'x', name: 'y', query: 'DROP TABLE users;' } }
+      );
+    });
+  }
+}
+
 console.log(`\n=== RISULTATI: ${pass} passati, ${fail} falliti su ${pass+fail} test ===\n`);
 if (failures.length) {
   console.log('FALLIMENTI:');

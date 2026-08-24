@@ -228,6 +228,21 @@ const MAX_SESSIONS = 100
 const FORBIDDEN_ORCHESTRATOR_TOOLS = ['glob', 'grep', 'read', 'sequential-thinking_sequentialthinking', 'bash', 'edit', 'write']
 
 /**
+ * Tool nativi di OpenCode (non MCP) che il dispatcher riconosce o che sono
+ * comunque parte del set base indipendentemente dal server MCP configurato.
+ * Usata SOLO per l'osservabilità 2.4 (log dei tool MCP sconosciuti) — non è un
+ * confine di sicurezza, può restare imprecisa senza creare un bypass.
+ * @type {Set<string>}
+ */
+const KNOWN_NATIVE_TOOLS = new Set([
+  'read', 'grep', 'glob', 'ls', 'cat', 'find',
+  'bash', 'edit', 'write', 'rm',
+  'webfetch', 'websearch',
+  'task', 'skill', 'question', 'invalid',
+  'todowrite', 'todoread', 'sequential-thinking_sequentialthinking'
+])
+
+/**
  * Ritorna un timestamp ISO 8601 in tempo locale (es. YYYY-MM-DDTHH:mm:ss.sss+HH:MM)
  * @returns {string}
  */
@@ -1056,6 +1071,27 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
           ? (sessionID === orchestratorSessionID)
           : (input.__isOrchestrator === true || (!caller && !state.lastAgent));
        // Nota: se non c'è nessun agente noto, l'attore è l'Orchestratore o un'identità ignota
+
+      // 2.4. OSSERVABILITÀ TOOL MCP SCONOSCIUTI (2026-08-25)
+      // FINDING: il dispatcher gestisce esplicitamente solo i tool nativi elencati
+      // sotto — qualsiasi tool MCP (nome dinamico, es. "supabase_apply_migration",
+      // "github_*", ecc.) non passa per NESSUN check di permesso (bashAllowlist,
+      // readOnlyDespiteFullBash, allowEdit, writeScope non si applicano). Un
+      // agente "tester" (bashAllowlist: []) o "verifier"/"debugger"
+      // (readOnlyDespiteFullBash: true) potrebbe chiamare direttamente un tool
+      // MCP distruttivo senza alcuna intercettazione.
+      // Decisione esplicita dell'utente (2026-08-25): SOLO logging per ora, nessun
+      // blocco — serve visibilità sull'ampiezza reale dell'uso prima di scegliere
+      // una policy di enforcement (allowlist per-agente vs. restrizione ereditata
+      // da bashAllowlist/readOnlyDespiteFullBash). Non è un confine di sicurezza:
+      // la lista sotto può restare imprecisa senza creare un bypass, è solo
+      // un'euristica "assomiglia a un tool nativo di OpenCode o no".
+      if (!KNOWN_NATIVE_TOOLS.has(input.tool)) {
+        runtimeLog(`🔍 MCP TOOL OSSERVATO (non enforced): tool="${input.tool}", sessionID=${sessionID}, agent=${subagentType || (isOrchestrator ? 'orchestrator' : 'unknown')}`);
+        persistAuditEvent(sessionID, 'mcp_tool_usage', subagentType || (isOrchestrator ? 'orchestrator' : 'unknown'), 'observed', {
+          tool: input.tool
+        });
+      }
 
       // 2.5. CHECK ASSOLUTO: L'Orchestratore non deve usare tool direttamente
       if (isOrchestrator) {
