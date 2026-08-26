@@ -356,18 +356,25 @@ const testExecutionPatterns = [
   /\bnpm\s+run\s+test\w*/i,
   /\byarn\s+test\b/i,
   /\bpnpm\s+test\b/i,
-  /\bpytest\b/i,
   /\bpython3?\s+-m\s+pytest\b/i,
   /\bpython3?\s+-m\s+unittest\b/i,
-  /\bjest\b/i,
   /\bnpx\s+jest\b/i,
-  /\bmocha\b/i,
   /\bnpx\s+mocha\b/i,
   /\bgo\s+test\b/i,
   /\bdotnet\s+test\b/i,
   /\bcargo\s+test\b/i,
-  /\brspec\b/i,
-  /\bphpunit\b/i,
+  // FIX (2026-08-25): jest/mocha/pytest/rspec/phpunit erano pattern "nudi"
+  // (\bTOOL\b) — matchavano il nome del tool ovunque nella stringa, incluso
+  // dentro un nome file (jest.setup.js, pytest.ini, phpunit.xml, mocha.opts
+  // sono nomi di file reali e comuni). Incidente reale: `git add ... jest.setup.js`
+  // bloccato come se fosse un'esecuzione di test. Ora richiedono che il tool sia
+  // in POSIZIONE di comando — a inizio stringa o dopo un operatore di
+  // concatenazione shell (&&, ;, |) — non semplicemente presente come sottostringa.
+  /(?:^|&&|;|\|)\s*jest\b/i,
+  /(?:^|&&|;|\|)\s*mocha\b/i,
+  /(?:^|&&|;|\|)\s*pytest\b/i,
+  /(?:^|&&|;|\|)\s*rspec\b/i,
+  /(?:^|&&|;|\|)\s*phpunit\b/i,
 ]
 
 /** @type {{regex: RegExp, message: string}[]} */

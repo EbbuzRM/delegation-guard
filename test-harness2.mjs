@@ -153,6 +153,24 @@ console.log('--- 4. NO TEST EXECUTION per executor ---');
   await expectBlock('executor non può eseguire pytest', () => call('bash', sess, { command: 'pytest tests/' }), 'TEST EXECUTION');
 }
 {
+  // Incidente reale 2026-08-25: `git add` su file il cui NOME contiene una
+  // parola-chiave di test-runner (jest.setup.js, *.test.ts) veniva scambiato
+  // per un'esecuzione di test — pattern "nudi" (\bjest\b ecc.) matchavano
+  // ovunque nella stringa, non solo quando il tool era davvero invocato.
+  const sess = await delegateAndCrystallize('executor', 'domain:implementation - git add file di test', 'domain:implementation causa root nota, git add');
+  await expectPass('git add su file con "jest"/"test" nel nome NON bloccato', () =>
+    call('bash', sess, { command: 'git add services/AuthService.ts hooks/__tests__/useEmailAuth.test.ts jest.setup.js services/__tests__/AuthService.test.ts' }));
+  await expectPass('git status su un progetto con file di test nel path NON bloccato', () =>
+    call('bash', sess, { command: 'git status --short' }));
+  await expectPass('lettura di pytest.ini/phpunit.xml/mocha.opts NON bloccata', () =>
+    call('bash', sess, { command: 'cat pytest.ini phpunit.xml mocha.opts' }));
+  // Regressione: l'invocazione REALE resta bloccata anche con file di test in giro.
+  await expectBlock('jest invocato realmente resta bloccato per executor', () =>
+    call('bash', sess, { command: 'jest --coverage' }), 'TEST EXECUTION');
+  await expectBlock('jest dopo un altro comando (&&) resta bloccato', () =>
+    call('bash', sess, { command: 'npm run build && jest' }), 'TEST EXECUTION');
+}
+{
   const sess = await delegateAndCrystallize('verifier', 'domain:verification - run tests', 'domain:verification esegui la suite di test');
   await expectPass('verifier PUO eseguire npm test', () => call('bash', sess, { command: 'npm test' }));
 }
