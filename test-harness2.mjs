@@ -169,6 +169,14 @@ console.log('--- 4. NO TEST EXECUTION per executor ---');
     call('bash', sess, { command: 'jest --coverage' }), 'TEST EXECUTION');
   await expectBlock('jest dopo un altro comando (&&) resta bloccato', () =>
     call('bash', sess, { command: 'npm run build && jest' }), 'TEST EXECUTION');
+  // Secondo incidente reale, stesso giorno: "jest" dentro un'alternanza regex
+  // tra virgolette (ricerca testuale, non esecuzione) — il fix precedente
+  // ancorava a "|" come pipe di shell ma un "|" senza spazio prima del tool è
+  // quasi sempre alternanza regex, non un vero pipe.
+  await expectPass('"jest" dentro un pattern regex tra virgolette (grep-like) NON bloccato', () =>
+    call('bash', sess, { command: 'git diff -- package.json | Select-String -Pattern "^[+-]\\s+\\"" | Select-String -Pattern "vector-icons|bottom-tabs|react-native|typescript|jest|metro|expo/cli|types/react"' }));
+  await expectBlock('jest dopo un pipe REALE (con spazio) resta bloccato', () =>
+    call('bash', sess, { command: 'npm run lint | jest' }), 'TEST EXECUTION');
 }
 {
   const sess = await delegateAndCrystallize('verifier', 'domain:verification - run tests', 'domain:verification esegui la suite di test');

@@ -367,14 +367,20 @@ const testExecutionPatterns = [
   // (\bTOOL\b) — matchavano il nome del tool ovunque nella stringa, incluso
   // dentro un nome file (jest.setup.js, pytest.ini, phpunit.xml, mocha.opts
   // sono nomi di file reali e comuni). Incidente reale: `git add ... jest.setup.js`
-  // bloccato come se fosse un'esecuzione di test. Ora richiedono che il tool sia
-  // in POSIZIONE di comando — a inizio stringa o dopo un operatore di
-  // concatenazione shell (&&, ;, |) — non semplicemente presente come sottostringa.
-  /(?:^|&&|;|\|)\s*jest\b/i,
-  /(?:^|&&|;|\|)\s*mocha\b/i,
-  /(?:^|&&|;|\|)\s*pytest\b/i,
-  /(?:^|&&|;|\|)\s*rspec\b/i,
-  /(?:^|&&|;|\|)\s*phpunit\b/i,
+  // bloccato come se fosse un'esecuzione di test. Richiesta posizione di comando
+  // (inizio stringa o dopo &&/;/|), ma un `|` SENZA spazio prima del tool è quasi
+  // sempre alternanza regex dentro una stringa tra virgolette, non un vero pipe
+  // di shell — secondo incidente reale: `Select-String -Pattern "...|jest|..."`
+  // (ricerca testuale della parola "jest", non un'esecuzione) ribloccato per lo
+  // stesso motivo. Ora l'operatore deve essere seguito da ALMENO uno spazio
+  // prima del nome del tool — un'alternanza regex tra virgolette non ha mai
+  // spazi attorno ai `|` (romperebbe il significato del pattern), un'invocazione
+  // reale dopo &&/;/| quasi sempre sì.
+  /(?:^\s*|(?:&&|;|\|)\s+)jest\b/i,
+  /(?:^\s*|(?:&&|;|\|)\s+)mocha\b/i,
+  /(?:^\s*|(?:&&|;|\|)\s+)pytest\b/i,
+  /(?:^\s*|(?:&&|;|\|)\s+)rspec\b/i,
+  /(?:^\s*|(?:&&|;|\|)\s+)phpunit\b/i,
 ]
 
 /** @type {{regex: RegExp, message: string}[]} */
