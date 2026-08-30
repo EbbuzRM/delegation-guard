@@ -480,6 +480,10 @@ const SENSITIVE_FILE_PATTERNS = [
   // glob) non veniva mai catturato. Ora matcha anche a fine stringa o con
   // un'estensione, restando ancorato a un confine di path prima del nome
   // (niente match parziale tipo "credentialsfile.txt" o "secretsauce.js").
+  // NOTA: "private" come nome di cartella è comune in codice di terze parti non
+  // legato a secret (es. React Native ships node_modules/react-native/src/private/,
+  // incidente reale 2026-08-25) — vedi isNodeModulesPath() sotto, applicata dai
+  // due punti che consumano questo pattern per escludere node_modules/.
   { name: 'secrets_directory', regex: /(^|\/|\\)(secrets|credentials|private)(\.[a-zA-Z0-9]+)?([\/\\]|$)/i, severity: 'high' },
   { name: 'pem_certificates', regex: /\.(pem|key|p12|pfx|jks)$/i, severity: 'high' },
   { name: 'netrc', regex: /(^|\/|\\)\.netrc$/i, severity: 'high' },
@@ -487,6 +491,20 @@ const SENSITIVE_FILE_PATTERNS = [
   { name: 'npmrc_with_auth', regex: /(^|\/|\\)\.npmrc$/i, severity: 'medium' },
   { name: 'docker_config', regex: /(^|\/|\\)\.docker[\/\\]config\.json$/i, severity: 'high' }
 ]
+
+/**
+ * true se il path (già normalizzato a forward-slash) attraversa node_modules/.
+ * Usato SOLO per escludere il pattern "secrets_directory" — "private" in
+ * particolare è un nome di cartella comune nel codice di terze parti senza
+ * nulla a che fare coi secret (es. node_modules/react-native/src/private/,
+ * incidente reale 2026-08-25); node_modules è codice di dipendenze installate,
+ * mai i secret dell'utente.
+ * @param {string} normalized
+ * @returns {boolean}
+ */
+function isNodeModulesPath(normalized) {
+  return /(^|\/)node_modules\//i.test(normalized)
+}
 
 
 /** @type {Record<string, {requiresAnyOf: string[], exceptions: string[], errorMessage: string}>} */
@@ -1232,6 +1250,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
           for (const token of pathTokens) {
             const normalizedToken = token.replace(/\\/g, '/')
             for (const pattern of SENSITIVE_FILE_PATTERNS) {
+              if (pattern.name === 'secrets_directory' && isNodeModulesPath(normalizedToken)) continue
               pattern.regex.lastIndex = 0
               if (pattern.regex.test(normalizedToken)) {
                 throw new Error(
@@ -2548,6 +2567,7 @@ function checkSensitiveFileAccess(agent, profile, filePath, toolName) {
   const normalized = filePath.replace(/\\/g, '/')
 
   for (const pattern of SENSITIVE_FILE_PATTERNS) {
+    if (pattern.name === 'secrets_directory' && isNodeModulesPath(normalized)) continue
     // Reset lastIndex (regex con flag /i e /g sono stateful)
     pattern.regex.lastIndex = 0
     if (pattern.regex.test(normalized)) {

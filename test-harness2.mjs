@@ -854,6 +854,18 @@ console.log('--- 20. SECRETS SENZA SLASH: nomi file bare (credentials, id_rsa) -
     call('read', sess, { filePath: 'credentialsfile.txt' }));
   await expectPass('lettura di "id_token" (termine OIDC comune) NON bloccata', () =>
     call('read', sess, { filePath: 'id_token' }));
+
+  // Incidente reale 2026-08-25: "private" come cartella dentro node_modules —
+  // React Native ships node_modules/react-native/src/private/... — bloccato dal
+  // pattern secrets_directory nonostante non abbia nulla a che fare coi secret.
+  await expectPass('Test-Path su node_modules/.../src/private/... NON bloccato', () =>
+    call('bash', sess, { command: 'Test-Path node_modules/react-native/src/private/devsupport/devmenu/DevMenu.js' }));
+  await expectPass('lettura diretta di un file dentro node_modules/.../private/ NON bloccata', () =>
+    call('read', sess, { filePath: 'node_modules/some-pkg/private/index.js' }));
+  // Regressione: "private"/"secrets"/"credentials" nel PROGETTO (fuori da
+  // node_modules) restano bloccati — l'esclusione è specifica alle dipendenze.
+  await expectBlock('cartella "private" nel progetto (non in node_modules) resta bloccata', () =>
+    call('read', sess, { filePath: 'app/private/user-notes.md' }));
 }
 
 console.log('--- 21. TOOL MCP SCONOSCIUTI: solo osservabilità, nessun blocco (decisione esplicita 2026-08-25) ---');
