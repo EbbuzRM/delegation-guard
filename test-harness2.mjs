@@ -145,6 +145,18 @@ for (const tool of ['read', 'grep', 'glob']) {
   const sess = await delegateAndCrystallize('executor', 'domain:implementation - npm install', 'domain:implementation causa root nota, installa dipendenze');
   await expectPass('bash comando normale (npm install)', () => call('bash', sess, { command: 'npm install' }));
 }
+{
+  // Segnalato dall'utente 2026-08-25: .env.example non contiene secret reali
+  // (documenta solo quali variabili esistono) — non ha senso bloccarlo come .env.
+  const sess = await delegateAndCrystallize('executor', 'domain:implementation - leggi env example', 'domain:implementation causa root nota, leggi env example');
+  await expectPass('.env.example NON bloccato', () => call('read', sess, { filePath: '.env.example' }));
+  await expectPass('.env.sample NON bloccato', () => call('read', sess, { filePath: '.env.sample' }));
+  await expectPass('.env.template NON bloccato', () => call('read', sess, { filePath: 'config/.env.template' }));
+  // Regressione: gli altri suffissi .env restano bloccati.
+  await expectBlock('.env.local resta bloccato', () => call('read', sess, { filePath: '.env.local' }));
+  await expectBlock('.env.production resta bloccato', () => call('read', sess, { filePath: '.env.production' }));
+  await expectBlock('test.env resta bloccato', () => call('read', sess, { filePath: 'test.env' }));
+}
 
 console.log('--- 4. NO TEST EXECUTION per executor ---');
 {

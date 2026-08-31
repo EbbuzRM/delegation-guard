@@ -461,7 +461,13 @@ function isSecretScanExcluded(filePath) {
  */
 const SENSITIVE_FILE_PATTERNS = [
   // Matcha: .env, .env.local, .env.development, test.env, production.env, config.env, ecc.
-  { name: 'env_files', regex: /(^|\/|\\)\.env(\.[a-zA-Z0-9_-]+)?$|\.env$/i, severity: 'critical' },
+  // FIX (2026-08-25): esclusi i suffissi placeholder convenzionali senza secret
+  // reali (.env.example, .env.sample, .env.template, .env.dist, .env.defaults) —
+  // segnalato dall'utente: bloccavano la normale lettura/modifica di file che
+  // documentano solo QUALI variabili esistono, mai valori reali. Altri suffissi
+  // (.env.local, .env.production, ecc.) restano bloccati — potrebbero contenere
+  // valori reali.
+  { name: 'env_files', regex: /(^|\/|\\)\.env(?!\.(example|sample|template|dist|defaults)$)(\.[a-zA-Z0-9_-]+)?$|\.env$/i, severity: 'critical' },
   { name: 'ssh_keys', regex: /(^|\/|\\)\.ssh[\/\\]id_[a-zA-Z0-9_-]+$/, severity: 'critical' },
   // FIX (2026-08-15): il pattern sopra richiede il prefisso ".ssh/" — un comando
   // che costruisce il path in pezzi (es. PowerShell Join-Path, o un token
