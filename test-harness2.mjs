@@ -1,14 +1,21 @@
 import { DelegationGuard } from './delegation-guard.js';
-import { readFileSync, existsSync, rmSync } from 'node:fs';
+import { readFileSync, existsSync, rmSync, mkdirSync, mkdtempSync } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 
 const mockClient = { tui: { showToast: async () => {} } };
+const testRoot = mkdtempSync(path.join(os.tmpdir(), 'delegation-guard-harness-'));
+process.chdir(testRoot);
+function projectRoot() {
+  mkdirSync(testRoot, { recursive: true });
+  return testRoot;
+}
 const guard = await DelegationGuard({
   project: { id: 'test-project' },
   client: mockClient,
   $: async () => {},
-  directory: '/home/claude/fake-project',
-  worktree: '/'
+  directory: projectRoot('main'),
+  worktree: projectRoot('main')
 });
 const before = guard['tool.execute.before'];
 
@@ -18,14 +25,14 @@ let callID = 0;
 let subCounter = 0;
 
 async function preloadConductorRules(guardObj, sessionID) {
-  // Normalizza come fa internamente l'hook (input.sessionID || 'default') —
-  // orchSession può arrivare undefined da chiamanti che lasciano il default.
+  // Normalize like the hook does internally (input.sessionID || 'default') —
+  // orchSession may arrive undefined from callers relying on the default.
   const sid = sessionID || 'default';
-  // Registra sid come root session (Orchestratore) via l'event hook
-  // "session.created" — stesso meccanismo di produzione (vedi guard4/event4
-  // sotto) — così isOrchestrator risolve true per questa sessionID SUBITO,
-  // senza dover passare da una vera task call (che self-heala solo DOPO,
-  // troppo tardi per sbloccare il gate sulla task call stessa).
+  // Register sid as the root (Orchestrator) session via the event hook
+  // "session.created" — same production mechanism (see guard4/event4
+  // below) — so isOrchestrator resolves true for this sessionID IMMEDIATELY,
+  // without going through a real task call (which self-heals only AFTERWARDS,
+  // too late to unlock the gate on the task call itself).
   const eventFn = guardObj['event'];
   if (eventFn) {
     await eventFn({ event: { type: 'session.created', properties: { sessionID: sid, info: { agent: 'orchestrator' } } } });
@@ -35,42 +42,40 @@ async function preloadConductorRules(guardObj, sessionID) {
   return beforeFn(
     { tool: 'skill', sessionID: sid, callID: 'call_' + callID },
     { args: { name: 'conductor-rules' } }
-  ).catch(() => {});
+  );
 }
 
 async function delegateAndCrystallize(subagentType, description, prompt, orchSession) {
-  // 0. Precarica conductor-rules per non incappare nel gate 2.6 (non è il focus qui)
+  // 0. Preload conductor-rules to avoid hitting gate 2.6 (not the focus here)
   await preloadConductorRules(guard, orchSession);
-  // 1. L'Orchestratore delega (dalla sua sessione)
+  // 1. The Orchestrator delegates (from its own session)
   callID++;
   await before(
     { tool: 'task', sessionID: orchSession, callID: 'call_' + callID },
     { args: { subagent_type: subagentType, description, prompt } }
-  ).catch(() => {}); // ignoriamo eventuali blocchi qui, non è il focus del test
-  // 2. Il subagent (nuova sessione) fa una prima tool call innocua per cristallizzare
+  );
+  // 2. The subagent (new session) makes a first harmless tool call to crystallize
   subCounter++;
   const subSession = 'ses_sub_' + subCounter;
   callID++;
-  try {
-    await before(
-      { tool: 'read', sessionID: subSession, callID: 'call_' + callID, args: { filePath: '/home/claude/fake-project/README.md' } },
-      { args: { filePath: '/home/claude/fake-project/README.md' } }
-    );
-  } catch (e) { /* ignora - non e' il focus */ }
+  await before(
+    { tool: 'read', sessionID: subSession, callID: 'call_' + callID, args: { filePath: 'README.md' } },
+    { args: { filePath: 'README.md' } }
+  );
   return subSession;
 }
 
 async function expectPass(name, fn) {
   try { await fn(); pass++; }
-  catch (e) { fail++; failures.push(`[DOVEVA PASSARE] ${name} -> BLOCCATO: ${e.message.split('\n')[0]}`); }
+  catch (e) { fail++; failures.push(`[SHOULD PASS] ${name} -> BLOCKED: ${e.message.split('\n')[0]}`); }
 }
 async function expectBlock(name, fn, mustContain) {
   try {
     await fn();
-    fail++; failures.push(`[DOVEVA BLOCCARE] ${name} -> PASSATO senza errori`);
+    fail++; failures.push(`[SHOULD BLOCK] ${name} -> PASSED without errors`);
   } catch (e) {
     if (mustContain && !e.message.includes(mustContain)) {
-      fail++; failures.push(`[MESSAGGIO SBAGLIATO] ${name} -> "${e.message.split('\n')[0]}" (atteso contenesse "${mustContain}")`);
+      fail++; failures.push(`[WRONG MESSAGE] ${name} -> "${e.message.split('\n')[0]}" (expected to contain "${mustContain}")`);
     } else pass++;
   }
 }
@@ -79,7 +84,7 @@ function call(tool, sessionID, args) {
   return before({ tool, sessionID, callID: 'call_' + callID, args }, { args });
 }
 async function taskCall(subagentType, description, prompt, orchSession = 'ses_orch_' + (++subCounter)) {
-  // Precarica conductor-rules per non incappare nel gate 2.6 (non è il focus qui)
+  // Preload conductor-rules to avoid hitting gate 2.6 (not the focus here)
   await preloadConductorRules(guard, orchSession);
   callID++;
   return before(
@@ -90,147 +95,149 @@ async function taskCall(subagentType, description, prompt, orchSession = 'ses_or
 
 // ============================================================
 console.log('--- 1. ROUTING / DOMAIN ---');
-await expectPass('domain corretto: executor/implementation con diagnosi', async () => {
-  await taskCall('executor', 'domain:implementation - fix bug X', 'domain:implementation causa root identificata, applica fix a bug X');
-  await call('read', 'ses_sub_r1', { filePath: '/home/claude/fake-project/a.txt' });
+await expectPass('correct domain: executor/implementation with diagnosis', async () => {
+  await taskCall('executor', 'domain:implementation - fix bug X', 'domain:implementation root cause identified, apply fix to bug X');
+  await call('read', 'ses_sub_r1', { filePath: 'a.txt' });
 });
 
-await expectBlock('domain mancante', () =>
-  taskCall('executor', 'fix bug X senza domain', 'Applica fix a bug X'), 'Dominio del task non dichiarato');
+await expectBlock('missing domain', () =>
+  taskCall('executor', 'fix bug X without domain', 'Apply fix to bug X'), 'Undeclared task domain');
 
 await expectPass('domain alias: architecture -> architecture_analysis', async () => {
-  await taskCall('codebase-mapper', 'domain:architecture - mappa progetto', 'domain:architecture Mappa architettura');
-  await call('read', 'ses_sub_r2', { filePath: '/home/claude/fake-project/b.txt' });
+  await taskCall('codebase-mapper', 'domain:architecture - map project', 'domain:architecture Map architecture');
+  await call('read', 'ses_sub_r2', { filePath: 'b.txt' });
 });
 
-await expectBlock('domain sbagliato per agente (review su code-reviewer)', () =>
-  taskCall('code-reviewer', 'domain:review - analisi', 'domain:review Analizza il piano'), 'esiste ma è gestito da');
+await expectBlock('wrong domain for agent (review on code-reviewer)', () =>
+  taskCall('code-reviewer', 'domain:review - analysis', 'domain:review Analyze the plan'), 'exists but is managed by');
 
-await expectPass('domain corretto per code-reviewer: quality_analysis', async () => {
-  await taskCall('code-reviewer', 'domain:quality_analysis - analisi codice', 'domain:quality_analysis Analizza qualità del codice');
-  await call('read', 'ses_sub_r3', { filePath: '/home/claude/fake-project/c.txt' });
+await expectPass('correct domain for code-reviewer: quality_analysis', async () => {
+  await taskCall('code-reviewer', 'domain:quality_analysis - code analysis', 'domain:quality_analysis Analyze code quality');
+  await call('read', 'ses_sub_r3', { filePath: 'c.txt' });
 });
 
-console.log('--- 2. WORKFLOW: fix richiede diagnosi ---');
-await expectBlock('executor fix senza diagnosi precedente', () =>
-  taskCall('executor', 'domain:implementation - fix bug Y', 'domain:implementation Fix del bug Y'), 'Fix richiede diagnosi prima');
+console.log('--- 2. WORKFLOW: fix requires diagnosis ---');
+await expectBlock('executor fix without prior diagnosis', () =>
+  taskCall('executor', 'domain:implementation - fix bug Y', 'domain:implementation Fix bug Y'), 'Fix requires diagnosis first');
 
-await expectPass('executor fix con causa root nel prompt', async () => {
-  await taskCall('executor', 'domain:implementation - fix bug Y', 'domain:implementation La causa root è: fix del bug Y');
-  await call('read', 'ses_sub_r4', { filePath: '/home/claude/fake-project/d.txt' });
+await expectPass('executor fix with root cause in prompt', async () => {
+  await taskCall('executor', 'domain:implementation - fix bug Y', 'domain:implementation The root cause is: fix for bug Y');
+  await call('read', 'ses_sub_r4', { filePath: 'd.txt' });
 });
 
 console.log('--- 3. SENSITIVE FILES (read/grep/glob/edit/write/bash) ---');
 for (const tool of ['read', 'grep', 'glob']) {
-  const sess = await delegateAndCrystallize('executor', 'domain:implementation - leggi config', 'domain:implementation causa root nota, leggi config');
+  const sess = await delegateAndCrystallize('executor', 'domain:implementation - read config', 'domain:implementation root cause known, read config');
   await expectBlock(`sensitive file via ${tool}`, () => call(tool, sess, { filePath: 'C:\\App\\project\\.env' }));
 }
 {
-  const sess = await delegateAndCrystallize('executor', 'domain:implementation - leggi file', 'domain:implementation causa root nota, leggi app.py');
-  await expectPass('read file normale', () => call('read', sess, { filePath: 'C:\\App\\project\\app.py' }));
+  const sess = await delegateAndCrystallize('executor', 'domain:implementation - read file', 'domain:implementation root cause known, read app.py');
+  await expectPass('normal file read', () => call('read', sess, { filePath: 'C:\\App\\project\\app.py' }));
 }
 {
-  const sess = await delegateAndCrystallize('executor', 'domain:implementation - edit config', 'domain:implementation causa root nota, modifica config');
+  const sess = await delegateAndCrystallize('executor', 'domain:implementation - edit config', 'domain:implementation root cause known, modify config');
   await expectBlock('sensitive file via edit', () => call('edit', sess, { filePath: 'C:\\App\\project\\.env', oldString: 'a', newString: 'b' }));
 }
 {
-  const sess = await delegateAndCrystallize('executor', 'domain:implementation - write config', 'domain:implementation causa root nota, scrivi config');
+  const sess = await delegateAndCrystallize('executor', 'domain:implementation - write config', 'domain:implementation root cause known, write config');
   await expectBlock('sensitive file via write', () => call('write', sess, { filePath: 'C:\\App\\project\\.env', content: 'x' }));
 }
 {
-  const sess = await delegateAndCrystallize('executor', 'domain:implementation - bash config', 'domain:implementation causa root nota, leggi con bash');
+  const sess = await delegateAndCrystallize('executor', 'domain:implementation - bash config', 'domain:implementation root cause known, read with bash');
   await expectBlock('sensitive file via bash Get-Content', () => call('bash', sess, { command: 'Get-Content "C:\\Users\\test\\.env"' }));
 }
 {
-  const sess = await delegateAndCrystallize('executor', 'domain:implementation - npm install', 'domain:implementation causa root nota, installa dipendenze');
-  await expectPass('bash comando normale (npm install)', () => call('bash', sess, { command: 'npm install' }));
+  const sess = await delegateAndCrystallize('executor', 'domain:implementation - npm install', 'domain:implementation root cause known, install dependencies');
+  await expectPass('normal bash command (npm install)', () => call('bash', sess, { command: 'npm install' }));
 }
 {
-  // Segnalato dall'utente 2026-08-25: .env.example non contiene secret reali
-  // (documenta solo quali variabili esistono) — non ha senso bloccarlo come .env.
-  const sess = await delegateAndCrystallize('executor', 'domain:implementation - leggi env example', 'domain:implementation causa root nota, leggi env example');
-  await expectPass('.env.example NON bloccato', () => call('read', sess, { filePath: '.env.example' }));
-  await expectPass('.env.sample NON bloccato', () => call('read', sess, { filePath: '.env.sample' }));
-  await expectPass('.env.template NON bloccato', () => call('read', sess, { filePath: 'config/.env.template' }));
-  // Regressione: gli altri suffissi .env restano bloccati.
-  await expectBlock('.env.local resta bloccato', () => call('read', sess, { filePath: '.env.local' }));
-  await expectBlock('.env.production resta bloccato', () => call('read', sess, { filePath: '.env.production' }));
-  await expectBlock('test.env resta bloccato', () => call('read', sess, { filePath: 'test.env' }));
+  // Reported by the user on 2026-08-25: .env.example holds no real secrets
+  // (it only documents which variables exist) — blocking it like .env makes no sense.
+  const sess = await delegateAndCrystallize('executor', 'domain:implementation - read env example', 'domain:implementation root cause known, read env example');
+  await expectPass('.env.example NOT blocked', () => call('read', sess, { filePath: '.env.example' }));
+  await expectPass('.env.sample NOT blocked', () => call('read', sess, { filePath: '.env.sample' }));
+  await expectPass('.env.template NOT blocked', () => call('read', sess, { filePath: 'config/.env.template' }));
+  // Regression: the other .env suffixes stay blocked.
+  await expectBlock('.env.local stays blocked', () => call('read', sess, { filePath: '.env.local' }));
+  await expectBlock('.env.production stays blocked', () => call('read', sess, { filePath: '.env.production' }));
+  await expectBlock('test.env stays blocked', () => call('read', sess, { filePath: 'test.env' }));
 }
 
-console.log('--- 4. NO TEST EXECUTION per executor ---');
+console.log('--- 4. NO TEST EXECUTION for executor ---');
 {
-  const sess = await delegateAndCrystallize('executor', 'domain:implementation - run tests', 'domain:implementation causa root nota, verifica');
-  await expectBlock('executor non può eseguire npm test', () => call('bash', sess, { command: 'npm test' }), 'TEST EXECUTION');
-  await expectBlock('executor non può eseguire pytest', () => call('bash', sess, { command: 'pytest tests/' }), 'TEST EXECUTION');
+  const sess = await delegateAndCrystallize('executor', 'domain:implementation - run tests', 'domain:implementation root cause known, verify');
+  await expectBlock('executor cannot run npm test', () => call('bash', sess, { command: 'npm test' }), 'TEST EXECUTION');
+  await expectBlock('executor cannot run pytest', () => call('bash', sess, { command: 'pytest tests/' }), 'TEST EXECUTION');
 }
 {
-  // Incidente reale 2026-08-25: `git add` su file il cui NOME contiene una
-  // parola-chiave di test-runner (jest.setup.js, *.test.ts) veniva scambiato
-  // per un'esecuzione di test — pattern "nudi" (\bjest\b ecc.) matchavano
-  // ovunque nella stringa, non solo quando il tool era davvero invocato.
-  const sess = await delegateAndCrystallize('executor', 'domain:implementation - git add file di test', 'domain:implementation causa root nota, git add');
-  await expectPass('git add su file con "jest"/"test" nel nome NON bloccato', () =>
+  // Real incident on 2026-08-25: `git add` on files whose NAME contains a
+  // test-runner keyword (jest.setup.js, *.test.ts) was mistaken
+  // for a test execution — "naked" patterns (\bjest\b etc.) matched
+  // anywhere in the string, not only when the tool was really invoked.
+  const sess = await delegateAndCrystallize('executor', 'domain:implementation - git add test file', 'domain:implementation root cause known, git add');
+  await expectPass('git add on files with "jest"/"test" in the name NOT blocked', () =>
     call('bash', sess, { command: 'git add services/AuthService.ts hooks/__tests__/useEmailAuth.test.ts jest.setup.js services/__tests__/AuthService.test.ts' }));
-  await expectPass('git status su un progetto con file di test nel path NON bloccato', () =>
+  await expectPass('git status on a project with test files in the path NOT blocked', () =>
     call('bash', sess, { command: 'git status --short' }));
-  await expectPass('lettura di pytest.ini/phpunit.xml/mocha.opts NON bloccata', () =>
+  await expectPass('reading pytest.ini/phpunit.xml/mocha.opts NOT blocked', () =>
     call('bash', sess, { command: 'cat pytest.ini phpunit.xml mocha.opts' }));
-  // Regressione: l'invocazione REALE resta bloccata anche con file di test in giro.
-  await expectBlock('jest invocato realmente resta bloccato per executor', () =>
+  // Regression: a REAL invocation stays blocked even with test files around.
+  await expectBlock('really invoked jest stays blocked for executor', () =>
     call('bash', sess, { command: 'jest --coverage' }), 'TEST EXECUTION');
-  await expectBlock('jest dopo un altro comando (&&) resta bloccato', () =>
+  await expectBlock('jest after another command (&&) stays blocked', () =>
     call('bash', sess, { command: 'npm run build && jest' }), 'TEST EXECUTION');
-  // Secondo incidente reale, stesso giorno: "jest" dentro un'alternanza regex
-  // tra virgolette (ricerca testuale, non esecuzione) — il fix precedente
-  // ancorava a "|" come pipe di shell ma un "|" senza spazio prima del tool è
-  // quasi sempre alternanza regex, non un vero pipe.
-  await expectPass('"jest" dentro un pattern regex tra virgolette (grep-like) NON bloccato', () =>
+  // Second real incident, same day: "jest" inside a quoted regex alternation
+  // in quotes (text search, not execution) — the previous fix
+  // anchored "|" as a shell pipe, but a "|" with no space before the tool is
+  // almost always regex alternation, not a real pipe.
+  await expectPass('"jest" inside a quoted regex pattern (grep-like) NOT blocked', () =>
     call('bash', sess, { command: 'git diff -- package.json | Select-String -Pattern "^[+-]\\s+\\"" | Select-String -Pattern "vector-icons|bottom-tabs|react-native|typescript|jest|metro|expo/cli|types/react"' }));
-  await expectBlock('jest dopo un pipe REALE (con spazio) resta bloccato', () =>
+  await expectBlock('jest after a REAL pipe (with space) stays blocked', () =>
     call('bash', sess, { command: 'npm run lint | jest' }), 'TEST EXECUTION');
 }
 {
-  const sess = await delegateAndCrystallize('verifier', 'domain:verification - run tests', 'domain:verification esegui la suite di test');
-  await expectPass('verifier PUO eseguire npm test', () => call('bash', sess, { command: 'npm test' }));
+  const sess = await delegateAndCrystallize('verifier', 'domain:verification - run tests', 'domain:verification run the test suite');
+  await expectPass('verifier CAN run npm test', () => call('bash', sess, { command: 'npm test' }));
 }
 
-console.log('--- 5. SHELL MUTATION per agenti readOnlyDespiteFullBash ---');
+console.log('--- 5. SHELL MUTATION for readOnlyDespiteFullBash agents ---');
 {
-  const sess = await delegateAndCrystallize('verifier', 'domain:verification - fix rapido', 'domain:verification verifica il file');
-  await expectBlock('verifier non può scrivere via Set-Content', () => call('bash', sess, { command: 'Set-Content -Path file.py -Value "x"' }), 'SHELL MUTATION');
-  await expectPass('verifier redirection 2>&1 non bloccata', () => call('bash', sess, { command: 'npx jest --runInBand 2>&1' }));
+  const sess = await delegateAndCrystallize('verifier', 'domain:verification - quick fix', 'domain:verification verify the file');
+  await expectBlock('verifier cannot write via Set-Content', () => call('bash', sess, { command: 'Set-Content -Path file.py -Value "x"' }), 'SHELL MUTATION');
+  await expectPass('verifier redirection 2>&1 not blocked', () => call('bash', sess, { command: 'npx jest --runInBand 2>&1' }));
 }
 {
-  const sess = await delegateAndCrystallize('debugger', 'domain:debugging - diagnosi', 'domain:debugging diagnostica il problema');
-  await expectBlock('debugger non può scrivere via sed -i', () => call('bash', sess, { command: 'sed -i "s/old/new/" file.py' }), 'SHELL MUTATION');
+  const sess = await delegateAndCrystallize('debugger', 'domain:debugging - diagnosis', 'domain:debugging diagnose the problem');
+  await expectBlock('debugger cannot write via sed -i', () => call('bash', sess, { command: 'sed -i "s/old/new/" file.py' }), 'SHELL MUTATION');
 }
 
-console.log('--- 6. ORCHESTRATOR non può usare tool direttamente ---');
+console.log('--- 6. ORCHESTRATOR cannot use tools directly ---');
 {
   const orchSession = 'ses_orch_direct_test';
-  // Stabilisce orchSession come Orchestratore riconosciuto (self-healing) con
-  // una vera delega, prima di testare i blocchi diretti — altrimenti isOrchestrator
-  // risulta false per questa sessione (nessuno l'ha mai vista delegare).
-  await taskCall('executor', 'domain:implementation - stabilisci orchestratore', 'domain:implementation causa root nota, stabilisci', orchSession).catch(() => {});
-  for (const tool of ['bash', 'edit', 'write', 'read', 'grep', 'glob']) {
-    await expectBlock(`orchestratore non può usare ${tool} direttamente`, () =>
+  // Establish orchSession as a recognized Orchestrator (self-healing) with
+  // a real delegation, before testing direct blocks — otherwise isOrchestrator
+  // resolves false for this session (nobody ever saw it delegate).
+  await taskCall('executor', 'domain:implementation - establish orchestrator', 'domain:implementation root cause known, establish', orchSession);
+  for (const tool of ['bash', 'edit', 'write', 'grep', 'glob']) {
+    await expectBlock(`orchestrator cannot use ${tool} directly`, () =>
       call(tool, orchSession, tool === 'bash' ? { command: 'echo hi' } : { filePath: 'x.txt' }));
   }
-  await expectPass('orchestratore PUO usare webfetch direttamente', () =>
+  await expectPass('orchestrator CAN use read directly', () =>
+    call('read', orchSession, { filePath: 'x.txt' }));
+  await expectPass('orchestrator CAN use webfetch directly', () =>
     call('webfetch', orchSession, { url: 'https://example.com' }));
-  await expectPass('orchestratore PUO usare websearch direttamente', () =>
+  await expectPass('orchestrator CAN use websearch directly', () =>
     call('websearch', orchSession, { query: 'test' }));
-  await expectPass('orchestratore PUO usare todowrite', () =>
+  await expectPass('orchestrator CAN use todowrite', () =>
     call('todowrite', orchSession, { todos: [] }));
 }
 
-console.log('--- 7. SWARM MODE: parallelo stesso agente OK, tipi diversi bloccati ---');
+console.log('--- 7. SWARM MODE: parallel same-agent OK, different types blocked ---');
 {
-  // Istanza fresca per evitare pendingAgentTypes residui dalle sezioni precedenti
+  // Fresh instance to avoid leftover pendingAgentTypes from previous sections
   const guard2 = await DelegationGuard({
     project: { id: 'test-project-swarm' }, client: mockClient, $: async () => {},
-    directory: '/home/claude/fake-project-swarm', worktree: '/'
+    directory: projectRoot('swarm'), worktree: projectRoot('swarm')
   });
   const before2 = guard2['tool.execute.before'];
   async function taskCall2(subagentType, description, prompt, orchSession) {
@@ -243,15 +250,15 @@ console.log('--- 7. SWARM MODE: parallelo stesso agente OK, tipi diversi bloccat
 
   const orchSessionA = 'ses_orch_swarm_testA';
   await preloadConductorRules(guard2, orchSessionA);
-  await expectPass('primo executor in parallelo', () =>
-    taskCall2('executor', 'domain:implementation - step1', 'domain:implementation causa root nota, step1', orchSessionA));
-  await expectPass('secondo executor in parallelo (swarm, stesso tipo OK)', () =>
-    taskCall2('executor', 'domain:implementation - step2', 'domain:implementation causa root nota, step2', orchSessionA));
+  await expectPass('first parallel executor', () =>
+    taskCall2('executor', 'domain:implementation - step1', 'domain:implementation root cause known, step1', orchSessionA));
+  await expectPass('second parallel executor (swarm, same type OK)', () =>
+    taskCall2('executor', 'domain:implementation - step2', 'domain:implementation root cause known, step2', orchSessionA));
 
   const orchSessionB = 'ses_orch_swarm_testB';
   const guard3 = await DelegationGuard({
     project: { id: 'test-project-swarm2' }, client: mockClient, $: async () => {},
-    directory: '/home/claude/fake-project-swarm2', worktree: '/'
+    directory: projectRoot('swarm2'), worktree: projectRoot('swarm2')
   });
   const before3 = guard3['tool.execute.before'];
   async function taskCall3(subagentType, description, prompt, orchSession) {
@@ -262,24 +269,24 @@ console.log('--- 7. SWARM MODE: parallelo stesso agente OK, tipi diversi bloccat
     );
   }
   await preloadConductorRules(guard3, orchSessionB);
-  await expectPass('prima delega explorer', () =>
-    taskCall3('explorer', 'domain:exploration - ctx', 'domain:exploration raccogli contesto', orchSessionB));
-  await expectBlock('delega parallela tipo diverso bloccata (explorer ancora pending)', () =>
-    taskCall3('codebase-mapper', 'domain:architecture - mappa', 'domain:architecture mappa architettura', orchSessionB),
+  await expectPass('first explorer delegation', () =>
+    taskCall3('explorer', 'domain:exploration - ctx', 'domain:exploration gather context', orchSessionB));
+  await expectBlock('parallel delegation of different type blocked (explorer still pending)', () =>
+    taskCall3('codebase-mapper', 'domain:architecture - map', 'domain:architecture map architecture', orchSessionB),
     'PARALLEL CONFLICT');
 }
 
-console.log('--- 8. ORCHESTRATOR HIJACK GUARD: subagent auto-delega prima di cristallizzare ---');
+console.log('--- 8. ORCHESTRATOR HIJACK GUARD: subagent self-delegates before crystallizing ---');
 {
-  // Regressione per il bug 2026-08-05: una sessione subagent la cui identità non è
-  // ancora cristallizzata (nessuna tool call reale fatta) e la cui prima azione è una
-  // delega diretta (es. verifier->executor via canDelegateTo) veniva scambiata per un
-  // nuovo Orchestratore, dirottando orchestratorSessionID e lasciando il VERO
-  // Orchestratore senza protezione. Fix: subagentRegistry (session.created) impedisce
-  // il dirottamento quando il registry ha già confermato che la sessione è una FIGLIA.
+  // Regression for the 2026-08-05 bug: a subagent session whose identity is not
+  // yet crystallized (no real tool call made) and whose first action is a
+  // direct delegation (e.g. verifier->executor via canDelegateTo) was mistaken for a
+  // new Orchestrator, hijacking orchestratorSessionID and leaving the REAL
+  // Orchestrator unprotected. Fix: subagentRegistry (session.created) prevents
+  // hijacking once the registry has confirmed the session is a CHILD.
   const guard4 = await DelegationGuard({
     project: { id: 'test-project-hijack' }, client: mockClient, $: async () => {},
-    directory: '/home/claude/fake-project-hijack', worktree: '/'
+    directory: projectRoot('hijack'), worktree: projectRoot('hijack')
   });
   const before4 = guard4['tool.execute.before'];
   const event4 = guard4['event'];
@@ -293,53 +300,65 @@ console.log('--- 8. ORCHESTRATOR HIJACK GUARD: subagent auto-delega prima di cri
   callID++;
   await before4(
     { tool: 'task', sessionID: orchSession, callID: 'call_' + callID },
-    { args: { subagent_type: 'verifier', description: 'domain:verification - verifica fix', prompt: 'domain:verification verifica il fix applicato' } }
-  ).catch(() => {});
+    { args: { subagent_type: 'verifier', description: 'domain:verification - verify fix', prompt: 'domain:verification verify the applied fix' } }
+  );
 
   const verifierSession = 'ses_sub_verifier_hijack_test';
-  // Simula session.created (registry) per verifier PRIMA che lui faccia qualsiasi
-  // tool call reale — libera pendingAgentTypes (fast-release) ma NON cristallizza
-  // state.lastAgent (quello richiede una tool call non-task).
+  // Simulate session.created (registry) for verifier BEFORE it makes any
+  // real tool call — frees pendingAgentTypes (fast-release) but does NOT crystallize
+  // state.lastAgent (that requires a non-task tool call).
   await event4({ event: { type: 'session.created', properties: { sessionID: verifierSession, info: { parentID: orchSession, agent: 'verifier' } } } });
 
-  await expectPass('verifier (non cristallizzato) delega direttamente executor', () => {
+  await expectPass('verifier (not crystallized) delegates directly to executor', () => {
     callID++;
     return before4(
       { tool: 'task', sessionID: verifierSession, callID: 'call_' + callID },
-      { args: { subagent_type: 'executor', description: 'domain:implementation - applica fix', prompt: 'domain:implementation causa root: verifica fallita, applica fix' } }
+      { args: { subagent_type: 'executor', description: 'domain:implementation - apply fix', prompt: 'domain:implementation root cause: verification failed, apply fix' } }
     );
   });
 
-  await expectBlock('Orchestratore resta protetto (non dirottato) dopo l\'auto-delega di verifier', () =>
-    call4('read', orchSession, { filePath: '/home/claude/fake-project-hijack/x.txt' }),
-    'Delega invece di usare read direttamente');
+  await expectPass('Orchestrator can use read after verifier self-delegation', () =>
+    call4('read', orchSession, { filePath: 'x.txt' }));
 
-  await expectPass('verifier NON scambiato per Orchestratore dopo aver delegato', () =>
-    call4('read', verifierSession, { filePath: '/home/claude/fake-project-hijack/y.txt' }));
+  await expectPass('verifier NOT mistaken for Orchestrator after delegating', () =>
+    call4('read', verifierSession, { filePath: 'y.txt' }));
 }
 
-console.log('--- 9. CONDUCTOR-RULES GATE: skill deve essere caricata prima della prima delega ---');
+console.log('--- 9. CONDUCTOR-RULES GATE: skill must load before the first delegation ---');
 {
   const guardGateBlock = await DelegationGuard({
     project: { id: 'test-project-gate-block' }, client: mockClient, $: async () => {},
-    directory: '/home/claude/fake-project-gate-block', worktree: '/'
+    directory: projectRoot('gate-block'), worktree: projectRoot('gate-block')
   });
   const beforeGB = guardGateBlock['tool.execute.before'];
-  await expectBlock('orchestratore delega senza aver caricato conductor-rules', () => {
+  await expectBlock('orchestrator delegates without loading conductor-rules', () => {
     callID++;
     return beforeGB(
       { tool: 'task', sessionID: 'ses_orch_gate_block', callID: 'call_' + callID },
-      { args: { subagent_type: 'executor', description: 'domain:implementation - test gate', prompt: 'domain:implementation causa root nota, test gate' } }
+      { args: { subagent_type: 'executor', description: 'domain:implementation - test gate', prompt: 'domain:implementation root cause known, test gate' } }
     );
   }, 'conductor-rules');
+
+  await expectPass('retry after loading conductor-rules to a different target causes no parallel conflict', async () => {
+    callID++;
+    await beforeGB(
+      { tool: 'skill', sessionID: 'ses_orch_gate_block', callID: 'call_' + callID },
+      { args: { name: 'conductor-rules' } }
+    );
+    callID++;
+    await beforeGB(
+      { tool: 'task', sessionID: 'ses_orch_gate_block', callID: 'call_' + callID },
+      { args: { subagent_type: 'codebase-mapper', description: 'domain:architecture - retry gate', prompt: 'domain:architecture map architecture after loading rules' } }
+    );
+  });
 }
 {
   const guardGateAllow = await DelegationGuard({
     project: { id: 'test-project-gate-allow' }, client: mockClient, $: async () => {},
-    directory: '/home/claude/fake-project-gate-allow', worktree: '/'
+    directory: projectRoot('gate-allow'), worktree: projectRoot('gate-allow')
   });
   const beforeGA = guardGateAllow['tool.execute.before'];
-  await expectPass('orchestratore carica conductor-rules poi delega con successo', async () => {
+  await expectPass('orchestrator loads conductor-rules then delegates successfully', async () => {
     callID++;
     await beforeGA(
       { tool: 'skill', sessionID: 'ses_orch_gate_allow', callID: 'call_' + callID },
@@ -348,46 +367,53 @@ console.log('--- 9. CONDUCTOR-RULES GATE: skill deve essere caricata prima della
     callID++;
     await beforeGA(
       { tool: 'task', sessionID: 'ses_orch_gate_allow', callID: 'call_' + callID },
-      { args: { subagent_type: 'executor', description: 'domain:implementation - test gate ok', prompt: 'domain:implementation causa root nota, test gate ok' } }
+      { args: { subagent_type: 'executor', description: 'domain:implementation - test gate ok', prompt: 'domain:implementation root cause known, test gate ok' } }
     );
   });
 }
 {
   const guardGateSub = await DelegationGuard({
     project: { id: 'test-project-gate-sub' }, client: mockClient, $: async () => {},
-    directory: '/home/claude/fake-project-gate-sub', worktree: '/'
+    directory: projectRoot('gate-sub'), worktree: projectRoot('gate-sub')
   });
   const beforeGS = guardGateSub['tool.execute.before'];
   const orchSessionGS = 'ses_orch_gate_sub_setup';
+  // Preload conductor-rules on the same guard/session: the task only serves
+  // to create the subagent for the next test, not to test the gate.
+  callID++;
+  await beforeGS(
+    { tool: 'skill', sessionID: orchSessionGS, callID: 'call_' + callID },
+    { args: { name: 'conductor-rules' } }
+  );
   callID++;
   await beforeGS(
     { tool: 'task', sessionID: orchSessionGS, callID: 'call_' + callID },
-    { args: { subagent_type: 'verifier', description: 'domain:verification - setup subagent', prompt: 'domain:verification setup subagent per gate test' } }
-  ).catch(() => {});
-
-  const subSessionGS = 'ses_sub_gate_nonorch';
-  // Cristallizza l'identità del subagent (lastAgent=verifier) con una tool call reale,
-  // come nelle altre sezioni (es. delegateAndCrystallize).
-  callID++;
-  await beforeGS(
-    { tool: 'read', sessionID: subSessionGS, callID: 'call_' + callID, args: { filePath: '/home/claude/fake-project-gate-sub/x.txt' } },
-    { args: { filePath: '/home/claude/fake-project-gate-sub/x.txt' } }
+    { args: { subagent_type: 'verifier', description: 'domain:verification - setup subagent', prompt: 'domain:verification setup subagent for gate test' } }
   );
 
-  await expectPass('subagent (non orchestratore) delega senza essere soggetto al gate conductor-rules', () => {
+  const subSessionGS = 'ses_sub_gate_nonorch';
+  // Crystallize the subagent identity (lastAgent=verifier) with a real tool call,
+  // like in the other sections (e.g. delegateAndCrystallize).
+  callID++;
+  await beforeGS(
+    { tool: 'read', sessionID: subSessionGS, callID: 'call_' + callID, args: { filePath: 'x.txt' } },
+    { args: { filePath: 'x.txt' } }
+  );
+
+  await expectPass('subagent (non-orchestrator) delegates without hitting the conductor-rules gate', () => {
     callID++;
     return beforeGS(
       { tool: 'task', sessionID: subSessionGS, callID: 'call_' + callID },
-      { args: { subagent_type: 'executor', description: 'domain:implementation - delega da subagent', prompt: 'domain:implementation causa root nota, delega da subagent' } }
+      { args: { subagent_type: 'executor', description: 'domain:implementation - delegate from subagent', prompt: 'domain:implementation root cause known, delegate from subagent' } }
     );
   });
 }
 {
-  // Simula riavvio del processo del plugin (es. chiusura/riapertura di OpenCode)
-  // sulla STESSA sessionID: una nuova istanza di DelegationGuard parte con
-  // sessionState (Map in-memory) vuota, ma lo storico messaggi della sessione
-  // (via client.session.messages) contiene già una chiamata a Skill('conductor-rules').
-  // Il gate non deve richiedere di ricaricarla una seconda volta.
+  // Simulate a plugin process restart (e.g. closing/reopening OpenCode)
+  // on the SAME sessionID: a new DelegationGuard instance starts with
+  // an empty in-memory Map sessionState, but the session message history
+  // (via client.session.messages) already holds a Skill('conductor-rules') call.
+  // The gate must not require loading it a second time.
   const restartSessionID = 'ses_orch_gate_restart';
   const mockClientWithHistory = {
     tui: { showToast: async () => {} },
@@ -408,43 +434,42 @@ console.log('--- 9. CONDUCTOR-RULES GATE: skill deve essere caricata prima della
   };
   const guardGateRestart = await DelegationGuard({
     project: { id: 'test-project-gate-restart' }, client: mockClientWithHistory, $: async () => {},
-    directory: '/home/claude/fake-project-gate-restart', worktree: '/'
+    directory: projectRoot('gate-restart'), worktree: projectRoot('gate-restart')
   });
   const beforeGR = guardGateRestart['tool.execute.before'];
-  await expectPass('dopo riavvio plugin (Map vuota) sulla stessa sessione, storico conferma conductor-rules già caricata', () => {
+  await expectPass('after plugin restart (empty Map) on the same session, history confirms conductor-rules already loaded', () => {
     callID++;
     return beforeGR(
       { tool: 'task', sessionID: restartSessionID, callID: 'call_' + callID },
-      { args: { subagent_type: 'executor', description: 'domain:implementation - test gate restart', prompt: 'domain:implementation causa root nota, test gate restart' } }
+      { args: { subagent_type: 'executor', description: 'domain:implementation - test gate restart', prompt: 'domain:implementation root cause known, test gate restart' } }
     );
   });
 }
 
-console.log('--- 10. SCOPE VIOLATION REPEAT-TARGET ESCALATION: stesso path fuori scope ripetuto ---');
+console.log('--- 10. SCOPE VIOLATION REPEAT-TARGET ESCALATION: same out-of-scope path repeated ---');
 {
-  // NOTA: usiamo process.cwd() come project directory (invece di un path fittizio
-  // stile /home/claude/...) e filePath RELATIVI — riflette come funzionano davvero
-  // normalizePathForCheck (strip di un solo "/" iniziale, non del prefisso progetto)
-  // e validatePathZone (containment via path.resolve). Con un project dir fittizio
-  // e filePath assoluti "prefissati", il check SCOPE (che si aspetta "spikes/...")
-  // fallirebbe sempre indipendentemente dallo scope reale, invalidando il test.
+  // NOTE: we use a real temp directory and RELATIVE filePaths — this mirrors how
+  // normalizePathForCheck really works (strips a single leading "/", not the project prefix)
+  // and validatePathZone (containment via path.resolve). With a fake project dir
+  // and prefixed absolute filePaths, the SCOPE check (which expects "spikes/...")
+  // would always fail regardless of the real scope, invalidating the test.
   const guardScope = await DelegationGuard({
     project: { id: 'test-project-scope-escalate' }, client: mockClient, $: async () => {},
-    directory: process.cwd(), worktree: '/'
+    directory: projectRoot('scope-escalate'), worktree: projectRoot('scope-escalate')
   });
   const beforeSE = guardScope['tool.execute.before'];
   const eventSE = guardScope['event'];
   const orchSessionSE = 'ses_orch_scope_escalate';
   const subSessionSE = 'ses_sub_scope_escalate';
 
-  // Registra la sessione root come Orchestratore e la sessione figlia come spiker,
-  // via l'event hook session.created — stesso meccanismo di produzione (vedi sezione 9).
+  // Register the root session as Orchestrator and the child session as spiker,
+  // via the session.created event hook — same production mechanism (see section 9).
   await eventSE({ event: { type: 'session.created', properties: { sessionID: orchSessionSE, info: { agent: 'orchestrator' } } } });
   await eventSE({ event: { type: 'session.created', properties: { sessionID: subSessionSE, info: { agent: 'spiker', parentID: orchSessionSE } } } });
 
   const outOfScopePath = 'src/real-fix.ts';
 
-  await expectBlock('1° tentativo su path fuori scope: errore SCOPE generico, non escalation', () => {
+  await expectBlock('1st attempt on out-of-scope path: generic SCOPE error, no escalation', () => {
     callID++;
     return beforeSE(
       { tool: 'write', sessionID: subSessionSE, callID: 'call_' + callID, args: { filePath: outOfScopePath, content: 'x' } },
@@ -452,7 +477,7 @@ console.log('--- 10. SCOPE VIOLATION REPEAT-TARGET ESCALATION: stesso path fuori
     );
   }, 'SCOPE');
 
-  await expectBlock('2° tentativo sullo STESSO path fuori scope: escalation a ROUTING/redelega', () => {
+  await expectBlock('2nd attempt on the SAME out-of-scope path: escalation to ROUTING/redelegate', () => {
     callID++;
     return beforeSE(
       { tool: 'write', sessionID: subSessionSE, callID: 'call_' + callID, args: { filePath: outOfScopePath, content: 'y' } },
@@ -461,7 +486,7 @@ console.log('--- 10. SCOPE VIOLATION REPEAT-TARGET ESCALATION: stesso path fuori
   }, 'ROUTING');
 
   const otherOutOfScopePath = 'src/other-file.ts';
-  await expectBlock('tentativo su un path DIVERSO, mai visto prima: errore SCOPE generico (no escalation prematura)', () => {
+  await expectBlock('attempt on a DIFFERENT, never-seen path: generic SCOPE error (no premature escalation)', () => {
     callID++;
     return beforeSE(
       { tool: 'write', sessionID: subSessionSE, callID: 'call_' + callID, args: { filePath: otherOutOfScopePath, content: 'z' } },
@@ -469,7 +494,7 @@ console.log('--- 10. SCOPE VIOLATION REPEAT-TARGET ESCALATION: stesso path fuori
     );
   }, 'SCOPE');
 
-  await expectPass('scrittura dentro il proprio writeScope resta permessa', () => {
+  await expectPass('write inside own writeScope stays allowed', () => {
     callID++;
     return beforeSE(
       { tool: 'write', sessionID: subSessionSE, callID: 'call_' + callID, args: { filePath: 'spikes/ok.js', content: 'x' } },
@@ -478,53 +503,53 @@ console.log('--- 10. SCOPE VIOLATION REPEAT-TARGET ESCALATION: stesso path fuori
   });
 }
 
-console.log('--- 11. FASE PRE-DELEGATION: tool "question" (domande interattive) sempre permesso ---');
+console.log('--- 11. PRE-DELEGATION PHASE: "question" tool (interactive questions) always allowed ---');
 {
   const guardPreDeleg = await DelegationGuard({
     project: { id: 'test-project-pre-delegation' }, client: mockClient, $: async () => {},
-    directory: '/home/claude/fake-project-pre-delegation', worktree: '/'
+    directory: projectRoot('pre-delegation'), worktree: projectRoot('pre-delegation')
   });
   const beforePD = guardPreDeleg['tool.execute.before'];
   const orchSessionPD = 'ses_orch_pre_delegation';
 
-  // Preload conductor-rules (gate 2.6) sulla sessione dell'Orchestratore.
+  // Preload conductor-rules (gate 2.6) on the Orchestrator session.
   callID++;
   await beforePD(
     { tool: 'skill', sessionID: orchSessionPD, callID: 'call_' + callID },
     { args: { name: 'conductor-rules' } }
   );
 
-  // Delega a explorer (canPreDelegate: true) → mette l'Orchestratore in fase 'pre-delegation'.
+  // Delegate to explorer (canPreDelegate: true) -> puts the Orchestrator into pre-delegation phase.
   callID++;
   await beforePD(
     { tool: 'task', sessionID: orchSessionPD, callID: 'call_' + callID },
-    { args: { subagent_type: 'explorer', description: 'domain:exploration - mappa il modulo auth', prompt: 'domain:exploration mappa il modulo auth prima di delegare il fix' } }
+    { args: { subagent_type: 'explorer', description: 'domain:exploration - map the auth module', prompt: 'domain:exploration map the auth module before delegating the fix' } }
   );
 
-  await expectPass('tool "question" permesso in fase pre-delegation (domanda interattiva all\'utente)', () => {
+  await expectPass('"question" tool allowed in pre-delegation phase (interactive user question)', () => {
     callID++;
     return beforePD(
-      { tool: 'question', sessionID: orchSessionPD, callID: 'call_' + callID, args: { text: 'Vuoi che proceda con l\'opzione A o B?' } },
-      { args: { text: 'Vuoi che proceda con l\'opzione A o B?' } }
+      { tool: 'question', sessionID: orchSessionPD, callID: 'call_' + callID, args: { text: 'Proceed with option A or B?' } },
+      { args: { text: 'Proceed with option A or B?' } }
     );
   });
 
-  await expectBlock('bash resta vietato in fase pre-delegation (nessun allentamento indesiderato)', () => {
+  await expectBlock('bash stays forbidden in pre-delegation phase (no unintended relaxation)', () => {
     callID++;
     return beforePD(
       { tool: 'bash', sessionID: orchSessionPD, callID: 'call_' + callID, args: { command: 'ls' } },
       { args: { command: 'ls' } }
     );
-  }, 'Delega');
+  }, 'Delegate');
 
-  // Incidente reale 2026-08-25: l'Orchestratore, dopo aver delegato a explorer
-  // (canPreDelegate: true → fase pre-delegation) per farsi riportare il contenuto
-  // di un file, tentava di usare il proprio tool MCP esclusivo
-  // supabase_apply_migration — bloccato perché non enumerato nella vecchia
-  // allowlist fissa. Nessun tool MCP dinamico può essere enumerato in anticipo,
-  // quindi ora la fase pre-delegation è una DENYLIST (stessi tool sempre vietati
-  // all'Orchestratore) invece di un'allowlist.
-  await expectPass('tool MCP dinamico mai visto prima (es. supabase_apply_migration) permesso in fase pre-delegation', () => {
+  // Real incident on 2026-08-25: the Orchestrator, after delegating to explorer
+  // (canPreDelegate: true → pre-delegation phase) to have a file's content reported
+  // back, tried to use its own exclusive MCP tool
+  // supabase_apply_migration — blocked because it was missing from the old
+  // fixed allowlist. No dynamic MCP tool can be enumerated in advance,
+  // so the pre-delegation phase is now a DENYLIST (same tools always forbidden
+  // to the Orchestrator) instead of an allowlist.
+  await expectPass('never-seen dynamic MCP tool (e.g. supabase_apply_migration) allowed in pre-delegation phase', () => {
     callID++;
     return beforePD(
       { tool: 'supabase_apply_migration', sessionID: orchSessionPD, callID: 'call_' + callID, args: { project_id: 'x', name: 'y', query: 'SELECT 1;' } },
@@ -533,21 +558,21 @@ console.log('--- 11. FASE PRE-DELEGATION: tool "question" (domande interattive) 
   });
 }
 
-console.log('--- 12. SHELL MUTATION via .NET diretto (bypass dei cmdlet PowerShell nominati) ---');
+console.log('--- 12. SHELL MUTATION via direct .NET (named PowerShell cmdlet bypass) ---');
 {
-  // Incidente reale 2026-08-14: "debugger" (readOnlyDespiteFullBash) ha scritto
-  // un file via [System.IO.File]::WriteAllText() invece di un cmdlet come
-  // Set-Content — nessun pattern lo copriva, comando passato come read-only.
+  // Real incident on 2026-08-14: "debugger" (readOnlyDespiteFullBash) wrote
+  // a file via [System.IO.File]::WriteAllText() instead of a cmdlet like
+  // Set-Content — no pattern covered it, the command passed as read-only.
   //
-  // Istanza dedicata (non la `guard` condivisa di sezioni 1-7 via delegateAndCrystallize):
-  // 'default' accumula decine di deleghe attraverso le sezioni precedenti, e l'anti-loop
-  // saturation guard può silenziosamente bloccare (catch ignorato in delegateAndCrystallize)
-  // la delega a debugger, lasciando currentActiveAgent sull'agente sbagliato — falso
-  // negativo del TEST, non del Guard. Identità via registry (session.created), come
-  // sezione 10, evita del tutto il problema.
+  // Dedicated instance (not the shared `guard` from sections 1-7 via delegateAndCrystallize):
+  // 'default' accumulates dozens of delegations across previous sections, and the anti-loop
+  // saturation guard could block delegation to debugger, leaving currentActiveAgent
+  // on the wrong agent — a false
+  // negative of the TEST, not of the Guard. Identity via registry (session.created), as in
+  // section 10, avoids the problem entirely.
   const guardNet = await DelegationGuard({
     project: { id: 'test-project-dotnet-mutation' }, client: mockClient, $: async () => {},
-    directory: '/home/claude/fake-project-dotnet-mutation', worktree: '/'
+    directory: projectRoot('dotnet-mutation'), worktree: projectRoot('dotnet-mutation')
   });
   const beforeNet = guardNet['tool.execute.before'];
   const eventNet = guardNet['event'];
@@ -556,7 +581,7 @@ console.log('--- 12. SHELL MUTATION via .NET diretto (bypass dei cmdlet PowerShe
   await eventNet({ event: { type: 'session.created', properties: { sessionID: orchSessionNet, info: { agent: 'orchestrator' } } } });
   await eventNet({ event: { type: 'session.created', properties: { sessionID: subSessionNet, info: { agent: 'debugger', parentID: orchSessionNet } } } });
 
-  await expectBlock('.NET File.WriteAllText (System.IO completo) bloccato per debugger', () => {
+  await expectBlock('.NET File.WriteAllText (full System.IO) blocked for debugger', () => {
     callID++;
     const command = '[System.IO.File]::WriteAllText("C:\\App\\project\\out.txt", $content)';
     return beforeNet(
@@ -565,7 +590,7 @@ console.log('--- 12. SHELL MUTATION via .NET diretto (bypass dei cmdlet PowerShe
     );
   }, 'SHELL MUTATION');
 
-  await expectBlock('.NET File.AppendAllLines (accelerator [IO.File]) bloccato per debugger', () => {
+  await expectBlock('.NET File.AppendAllLines ([IO.File] accelerator) blocked for debugger', () => {
     callID++;
     const command = '[IO.File]::AppendAllLines("C:\\App\\project\\log.txt", $lines)';
     return beforeNet(
@@ -574,7 +599,7 @@ console.log('--- 12. SHELL MUTATION via .NET diretto (bypass dei cmdlet PowerShe
     );
   }, 'SHELL MUTATION');
 
-  await expectBlock('.NET Directory.CreateDirectory bloccato per debugger', () => {
+  await expectBlock('.NET Directory.CreateDirectory blocked for debugger', () => {
     callID++;
     const command = '[System.IO.Directory]::CreateDirectory("C:\\App\\project\\newdir")';
     return beforeNet(
@@ -583,7 +608,7 @@ console.log('--- 12. SHELL MUTATION via .NET diretto (bypass dei cmdlet PowerShe
     );
   }, 'SHELL MUTATION');
 
-  await expectPass('.NET File.ReadAllText resta permesso (sola lettura) per debugger', () => {
+  await expectPass('.NET File.ReadAllText stays allowed (read-only) for debugger', () => {
     callID++;
     const command = '[System.IO.File]::ReadAllText("C:\\App\\project\\in.txt")';
     return beforeNet(
@@ -593,14 +618,14 @@ console.log('--- 12. SHELL MUTATION via .NET diretto (bypass dei cmdlet PowerShe
   });
 }
 
-console.log('--- 13. UNKNOWN SUBAGENT_TYPE: delega a un agente non configurato deve bloccare, non passare in silenzio ---');
+console.log('--- 13. UNKNOWN SUBAGENT_TYPE: delegating to an unconfigured agent must block, not pass silently ---');
 {
-  // Incidente reale 2026-08-15: delega a "general" (agente generico nativo di
-  // OpenCode, non presente in guard-config.json) eseguita con ZERO enforcement —
-  // il vecchio codice faceva `return` silenzioso saltando tutti i check.
+  // Real incident on 2026-08-15: delegating to "general" (native generic OpenCode
+  // agent, absent from guard-config.json) ran with ZERO enforcement —
+  // the old code did a silent `return`, skipping all checks.
   const guardUnknown = await DelegationGuard({
     project: { id: 'test-project-unknown-agent' }, client: mockClient, $: async () => {},
-    directory: '/home/claude/fake-project-unknown-agent', worktree: '/'
+    directory: projectRoot('unknown-agent'), worktree: projectRoot('unknown-agent')
   });
   const beforeUA = guardUnknown['tool.execute.before'];
   const orchSessionUA = 'ses_orch_unknown_agent';
@@ -611,82 +636,82 @@ console.log('--- 13. UNKNOWN SUBAGENT_TYPE: delega a un agente non configurato d
     { args: { name: 'conductor-rules' } }
   );
 
-  await expectBlock('delega a subagent_type "general" (non configurato) bloccata', () => {
+  await expectBlock('delegation to unconfigured subagent_type "general" blocked', () => {
     callID++;
     return beforeUA(
       { tool: 'task', sessionID: orchSessionUA, callID: 'call_' + callID },
-      { args: { subagent_type: 'general', description: 'domain:implementation - fix rapido', prompt: 'domain:implementation causa root nota, fix rapido' } }
+      { args: { subagent_type: 'general', description: 'domain:implementation - quick fix', prompt: 'domain:implementation root cause known, quick fix' } }
     );
   }, 'ROUTING');
 
-  await expectPass('task senza subagent_type non genera un blocco custom (OpenCode rifiuta a livello di schema)', () => {
+  await expectPass('task without subagent_type causes no custom block (OpenCode rejects at schema level)', () => {
     callID++;
     return beforeUA(
       { tool: 'task', sessionID: orchSessionUA, callID: 'call_' + callID },
-      { args: { description: 'domain:implementation - fix senza target', prompt: 'domain:implementation causa root nota' } }
+      { args: { description: 'domain:implementation - fix without target', prompt: 'domain:implementation root cause known' } }
     );
   });
 }
 
-console.log('--- 14. SECRET SCAN: falso positivo su lettura dei file sorgente del Guard ---');
+console.log('--- 14. SECRET SCAN: false positive when reading the Guard source files ---');
 {
-  // Incidente reale 2026-08-15: delegation-guard.js contiene ESEMPI testuali di
-  // pattern sensibili nei propri commenti (per documentare cosa i pattern
-  // rilevano) — leggerlo triggerava la redazione dell'intero file. Verifica sia
-  // che i file del Guard siano ora esclusi, sia che la detection generica su
-  // ALTRI file NON sia stata indebolita dall'esclusione.
+  // Real incident on 2026-08-15: delegation-guard.js holds TEXTUAL examples of
+  // sensitive patterns in its own comments (documenting what the patterns
+  // detect) — reading it triggered redaction of the whole file. Verify both
+  // that the Guard files are now excluded, and that generic detection on
+  // OTHER files was NOT weakened by the exclusion.
   const guardSecret = await DelegationGuard({
     project: { id: 'test-project-secret-scan' }, client: mockClient, $: async () => {},
-    directory: '/home/claude/fake-project-secret-scan', worktree: '/'
+    directory: projectRoot('secret-scan'), worktree: projectRoot('secret-scan')
   });
   const eventSecret = guardSecret['event'];
   const beforeSecret = guardSecret['tool.execute.before'];
   const afterSecret = guardSecret['tool.execute.after'];
   const subSessionSecret = 'ses_sub_secret_scan';
   await eventSecret({ event: { type: 'session.created', properties: { sessionID: subSessionSecret, info: { agent: 'debugger', parentID: 'ses_orch_secret_scan' } } } });
-  // Cristallizza state.lastAgent='debugger' — tool.execute.after legge SOLO
-  // state.lastAgent (sessionState, popolata da tool.execute.before), non il
-  // subagentRegistry popolato dall'event hook sopra.
+  // Crystallize state.lastAgent='debugger' — tool.execute.after reads ONLY
+  // state.lastAgent (sessionState, populated by tool.execute.before), not the
+  // subagentRegistry populated by the event hook above.
   callID++;
   await beforeSecret(
-    { tool: 'read', sessionID: subSessionSecret, callID: 'call_' + callID, args: { filePath: '/home/claude/fake-project-secret-scan/README.md' } },
-    { args: { filePath: '/home/claude/fake-project-secret-scan/README.md' } }
+    { tool: 'read', sessionID: subSessionSecret, callID: 'call_' + callID, args: { filePath: 'README.md' } },
+    { args: { filePath: 'README.md' } }
   );
 
-  await expectPass('lettura di delegation-guard.js NON viene redatta (contiene solo esempi testuali)', async () => {
-    const output = { args: { filePath: 'C:\\Users\\test\\.opencode\\plugins\\delegation-guard.js' }, output: 'commento di esempio: cartella .ssh, chiave id_rsa nel path .ssh/id_rsa' };
+  await expectPass('reading delegation-guard.js is NOT redacted (contains only textual examples)', async () => {
+    const output = { args: { filePath: 'C:\\Users\\test\\.opencode\\plugins\\delegation-guard.js' }, output: 'sample comment: .ssh folder, id_rsa key in path .ssh/id_rsa' };
     await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
     if (output.output.includes('REDACTED')) {
-      throw new Error(`atteso contenuto intatto, trovato: ${output.output}`);
+      throw new Error(`expected intact content, found: ${output.output}`);
     }
   });
 
-  await expectPass('lettura di un file NON escluso con un secret reale viene ANCORA redatta (nessuna regressione)', async () => {
-    const output = { args: { filePath: 'C:\\Users\\test\\project\\some-other-file.js' }, output: 'chiave privata: .ssh/id_rsa' };
+  await expectPass('reading a NON-excluded file with a real secret still gets redacted (no regression)', async () => {
+    const output = { args: { filePath: 'C:\\Users\\test\\project\\some-other-file.js' }, output: 'private key: .ssh/id_rsa' };
     await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
     if (!output.output.includes('REDACTED')) {
-      throw new Error(`atteso REDACTED, trovato contenuto intatto: ${output.output}`);
+      throw new Error(`expected REDACTED, found intact content: ${output.output}`);
     }
   });
 }
 
-console.log('--- 15. PATH TRAVERSAL BYPASS: fallback su worktree quando directory è inaffidabile ---');
+console.log('--- 15. PATH TRAVERSAL BYPASS: worktree fallback when directory is unreliable ---');
 {
-  // Incidente reale: quando `directory` finisce dentro .opencode/plugins (bug
-  // OpenCode noto), il vecchio codice saltava TUTTO il containment check —
-  // nessun altro check ferma un path assoluto fuori progetto. Ora usa `worktree`
-  // come radice di fallback prima di arrendersi allo skip totale.
+  // Real incident: when `directory` ends up inside .opencode/plugins (known
+  // OpenCode bug), the old code skipped the ENTIRE containment check —
+  // no other check stops an absolute path outside the project. Now it uses `worktree`
+  // as the fallback root before giving up with a total skip.
   const guardTraversal = await DelegationGuard({
     project: { id: 'test-project-traversal' }, client: mockClient, $: async () => {},
-    directory: 'C:\\Users\\test\\.opencode\\plugins', // inaffidabile di proposito
-    worktree: 'C:\\Users\\test\\real-project' // fallback affidabile
+    directory: 'C:\\Users\\test\\.opencode\\plugins', // unreliable on purpose
+    worktree: 'C:\\Users\\test\\real-project' // reliable fallback
   });
   const beforeTrav = guardTraversal['tool.execute.before'];
   const eventTrav = guardTraversal['event'];
   const subSessionTrav = 'ses_sub_traversal';
   await eventTrav({ event: { type: 'session.created', properties: { sessionID: subSessionTrav, info: { agent: 'executor', parentID: 'ses_orch_traversal' } } } });
 
-  await expectBlock('write fuori dal worktree di fallback viene bloccata (era: nessun blocco)', () => {
+  await expectBlock('write outside the fallback worktree gets blocked (was: no block)', () => {
     callID++;
     const filePath = 'C:\\Windows\\System32\\evil.txt';
     return beforeTrav(
@@ -695,7 +720,7 @@ console.log('--- 15. PATH TRAVERSAL BYPASS: fallback su worktree quando director
     );
   }, 'PATH OUT OF PROJECT');
 
-  await expectPass('write dentro il worktree di fallback resta permessa', () => {
+  await expectPass('write inside the fallback worktree stays allowed', () => {
     callID++;
     const filePath = 'C:\\Users\\test\\real-project\\src\\ok.txt';
     return beforeTrav(
@@ -705,13 +730,12 @@ console.log('--- 15. PATH TRAVERSAL BYPASS: fallback su worktree quando director
   });
 }
 
-console.log('--- 16. INCIDENTS.md INJECTION: newline in un errore non deve forgiare entry finte ---');
+console.log('--- 16. INCIDENTS.md INJECTION: newline in an error must not forge fake entries ---');
 {
-  const injectionProjectDir = path.join(process.cwd(), '.tmp-test-incidents-injection');
-  if (existsSync(injectionProjectDir)) rmSync(injectionProjectDir, { recursive: true, force: true });
+  const injectionProjectDir = mkdtempSync(path.join(os.tmpdir(), 'delegation-guard-incidents-injection-'));
   const guardInj = await DelegationGuard({
     project: { id: 'test-project-injection' }, client: mockClient, $: async () => {},
-    directory: injectionProjectDir, worktree: '/'
+    directory: injectionProjectDir, worktree: injectionProjectDir
   });
   const beforeInj = guardInj['tool.execute.before'];
   const orchSessionInj = 'ses_orch_injection';
@@ -721,43 +745,41 @@ console.log('--- 16. INCIDENTS.md INJECTION: newline in un errore non deve forgi
     { args: { name: 'conductor-rules' } }
   );
 
-  // subagent_type stesso è il vettore: finisce grezzo nell'errore ROUTING (fix #13)
-  // e quindi in INCIDENTS.md — un \n seguito da una fake entry markdown, se non
-  // sanitizzato, apparirebbe come una entry di audit reale e distinta.
-  const maliciousAgent = 'evil\n### [INC-9999] [fake_check] | 2020-01-01 | fake-agent | Stato: bloccato | ENTRY FALSA INIETTATA';
-  await expectBlock('delega con subagent_type malevolo viene comunque bloccata (routing)', () => {
+  // the subagent_type itself is the vector: it lands raw in the ROUTING error (fix #13)
+  // and hence in INCIDENTS.md — a \n followed by a fake markdown entry would, if not
+  // sanitized, look like a real, separate audit entry.
+  const maliciousAgent = 'evil\n### [INC-9999] [fake_check] | 2020-01-01 | fake-agent | State: blocked | FAKE INJECTED ENTRY';
+  await expectBlock('delegation with malicious subagent_type still blocked (routing)', () => {
     callID++;
     return beforeInj(
       { tool: 'task', sessionID: orchSessionInj, callID: 'call_' + callID },
-      { args: { subagent_type: maliciousAgent, description: 'domain:implementation - test injection', prompt: 'domain:implementation causa root nota, test injection' } }
+      { args: { subagent_type: maliciousAgent, description: 'domain:implementation - test injection', prompt: 'domain:implementation root cause known, test injection' } }
     );
   }, 'ROUTING');
 
   const incidentsPath = path.join(injectionProjectDir, '.planning', 'INCIDENTS.md');
-  await expectPass('INCIDENTS.md non contiene una entry INC-9999 iniettata (solo l\'entry reale)', () => {
-    if (!existsSync(incidentsPath)) throw new Error('INCIDENTS.md non è stato scritto');
+  await expectPass('INCIDENTS.md contains no injected INC-9999 entry (only the real entry)', () => {
+    if (!existsSync(incidentsPath)) throw new Error('INCIDENTS.md was not written');
     const content = readFileSync(incidentsPath, 'utf8');
-    // "INC-9999" come TESTO INERTE dentro l'unica entry reale è atteso e corretto
-    // (prova che il payload non ha creato una nuova riga) — il check vero è che
-    // esista UNA SOLA riga che inizia con "### [INC-", non l'assenza della
-    // sottostringa (che comparirebbe comunque, sanitizzata, dentro l'entry reale).
+    // "INC-9999" as INERT TEXT inside the single real entry is expected and correct
+    // (proof the payload created no new line) — the real check is that
+    // exactly ONE line starts with "### [INC-", not the absence of the
+    // substring (which would appear anyway, sanitized, inside the real entry).
     const incidentHeaders = content.match(/^### \[INC-/gm) || [];
     if (incidentHeaders.length !== 1) {
-      throw new Error(`attesa 1 sola entry reale (l'injection avrebbe creato una 2a riga "### [INC-9999]"), trovate ${incidentHeaders.length}: ${content}`);
+      throw new Error(`expected exactly 1 real entry (the injection would have created a 2nd "### [INC-9999]" line), found ${incidentHeaders.length}: ${content}`);
     }
   });
   rmSync(injectionProjectDir, { recursive: true, force: true });
 }
 
-console.log('--- 17. AUDIT DIR PROTETTA: .planning/audit, INCIDENTS.md, metrics_count.json non modificabili ---');
+console.log('--- 17. PROTECTED AUDIT DIR: .planning/audit, INCIDENTS.md, metrics_count.json not modifiable ---');
 {
-  // Istanza dedicata con directory=process.cwd(): la `guard` condivisa risolve i
-  // path relativi contro il process.cwd() reale, non contro il suo fake project
-  // dir — con quella, un path relativo qui darebbe sempre PATH OUT OF PROJECT
-  // indipendentemente dal fix in test (stesso gotcha della sezione 12).
+  // Dedicated instance with a real temp directory: relative paths resolve
+  // inside the same root, so they exercise writeScope after containment.
   const guardAudit = await DelegationGuard({
     project: { id: 'test-project-audit-dir' }, client: mockClient, $: async () => {},
-    directory: process.cwd(), worktree: '/'
+    directory: projectRoot('audit-dir'), worktree: projectRoot('audit-dir')
   });
   const beforeAudit = guardAudit['tool.execute.before'];
   const eventAudit = guardAudit['event'];
@@ -770,24 +792,24 @@ console.log('--- 17. AUDIT DIR PROTETTA: .planning/audit, INCIDENTS.md, metrics_
     return beforeAudit({ tool, sessionID, callID: 'call_' + callID, args }, { args });
   }
 
-  await expectBlock('write su .planning/audit/*.jsonl bloccata', () =>
+  await expectBlock('write to .planning/audit/*.jsonl blocked', () =>
     callAudit('write', execSession, { filePath: '.planning/audit/audit-2026-01-01.jsonl', content: '{}' }), 'audit trail');
-  await expectBlock('write su .planning/INCIDENTS.md bloccata', () =>
+  await expectBlock('write to .planning/INCIDENTS.md blocked', () =>
     callAudit('write', execSession, { filePath: '.planning/INCIDENTS.md', content: 'x' }), 'audit trail');
-  await expectBlock('write su .opencode/metrics_count.json bloccata', () =>
+  await expectBlock('write to .opencode/metrics_count.json blocked', () =>
     callAudit('write', execSession, { filePath: '.opencode/metrics_count.json', content: '{}' }), 'audit trail');
 
-  // Regressione: .planning/ nel suo complesso NON deve diventare vietata —
-  // explorer ha legittimamente writeScope 'planning'.
-  await expectPass('write su .planning/altro-file.md (non audit) resta permessa per explorer', () =>
+  // Regression: .planning/ as a whole must NOT become forbidden —
+  // explorer legitimately has writeScope 'planning'.
+  await expectPass('write to .planning/other-file.md (non-audit) stays allowed for explorer', () =>
     callAudit('write', explorerSession, { filePath: '.planning/analysis-note.md', content: 'x' }));
 }
 
-console.log('--- 18. MAX_SESSIONS LRU: l\'Orchestratore non viene evitto anche oltre il limite ---');
+console.log('--- 18. MAX_SESSIONS LRU: the Orchestrator is never evicted even over the limit ---');
 {
   const guardLru = await DelegationGuard({
     project: { id: 'test-project-lru' }, client: mockClient, $: async () => {},
-    directory: '/home/claude/fake-project-lru', worktree: '/'
+    directory: projectRoot('lru'), worktree: projectRoot('lru')
   });
   const beforeLru = guardLru['tool.execute.before'];
   const eventLru = guardLru['event'];
@@ -799,34 +821,34 @@ console.log('--- 18. MAX_SESSIONS LRU: l\'Orchestratore non viene evitto anche o
     { args: { name: 'conductor-rules' } }
   );
 
-  // Riempie la Map ben oltre MAX_SESSIONS (100) con altre sessioni innocue —
-  // registrate come subagent (verifier) via l'event hook, altrimenti senza
-  // identità nota vengono scambiate per l'Orchestratore stesso (self-healing)
-  // e bloccate su 'read' diretto.
+  // Fill the Map well beyond MAX_SESSIONS (100) with other harmless sessions —
+  // registered as subagents (verifier) via the event hook, otherwise with no
+  // known identity they are mistaken for the Orchestrator itself (self-healing)
+  // and blocked on direct 'read'.
   for (let i = 0; i < 120; i++) {
     const fillerSession = `ses_filler_${i}`;
     await eventLru({ event: { type: 'session.created', properties: { sessionID: fillerSession, info: { agent: 'verifier', parentID: orchSessionLru } } } });
     callID++;
     await beforeLru(
-      { tool: 'read', sessionID: fillerSession, callID: 'call_' + callID, args: { filePath: `/home/claude/fake-project-lru/f${i}.txt` } },
-      { args: { filePath: `/home/claude/fake-project-lru/f${i}.txt` } }
+      { tool: 'read', sessionID: fillerSession, callID: 'call_' + callID, args: { filePath: `f${i}.txt` } },
+      { args: { filePath: `f${i}.txt` } }
     );
   }
 
-  await expectPass('l\'Orchestratore delega ancora senza dover ricaricare conductor-rules dopo 120 sessioni', () => {
+  await expectPass('the Orchestrator still delegates without reloading conductor-rules after 120 sessions', () => {
     callID++;
     return beforeLru(
       { tool: 'task', sessionID: orchSessionLru, callID: 'call_' + callID },
-      { args: { subagent_type: 'executor', description: 'domain:implementation - test LRU', prompt: 'domain:implementation causa root nota, test LRU' } }
+      { args: { subagent_type: 'executor', description: 'domain:implementation - test LRU', prompt: 'domain:implementation root cause known, test LRU' } }
     );
   });
 }
 
-console.log('--- 19. SECRET PATTERNS: coverage OpenAI / Slack / Google ---');
+console.log('--- 19. SECRET PATTERNS: OpenAI / Slack / Google coverage ---');
 {
   const guardCoverage = await DelegationGuard({
     project: { id: 'test-project-secret-coverage' }, client: mockClient, $: async () => {},
-    directory: '/home/claude/fake-project-secret-coverage', worktree: '/'
+    directory: projectRoot('secret-coverage'), worktree: projectRoot('secret-coverage')
   });
   const eventCov = guardCoverage['event'];
   const beforeCov = guardCoverage['tool.execute.before'];
@@ -835,65 +857,65 @@ console.log('--- 19. SECRET PATTERNS: coverage OpenAI / Slack / Google ---');
   await eventCov({ event: { type: 'session.created', properties: { sessionID: subSessionCov, info: { agent: 'debugger', parentID: 'ses_orch_secret_coverage' } } } });
   callID++;
   await beforeCov(
-    { tool: 'read', sessionID: subSessionCov, callID: 'call_' + callID, args: { filePath: '/home/claude/fake-project-secret-coverage/README.md' } },
-    { args: { filePath: '/home/claude/fake-project-secret-coverage/README.md' } }
+    { tool: 'read', sessionID: subSessionCov, callID: 'call_' + callID, args: { filePath: 'README.md' } },
+    { args: { filePath: 'README.md' } }
   );
 
   const cases = [
     ['OpenAI', 'sk-' + 'a'.repeat(48)],
-    ['Slack', 'xoxb-' + 'f'.repeat(20)], // forma non realistica di proposito — evita il push protection scanner di GitHub
+    ['Slack', 'xoxb-' + 'f'.repeat(20)], // deliberately unrealistic shape — avoids the GitHub push-protection scanner
     ['Google', 'AIza' + 'S'.repeat(35)],
   ];
   for (const [name, secret] of cases) {
-    await expectPass(`chiave ${name} nell'output viene redatta`, async () => {
-      const output = { args: { filePath: '/home/claude/fake-project-secret-coverage/config.txt' }, output: `valore: ${secret}` };
+    await expectPass(`${name} key in output gets redacted`, async () => {
+      const output = { args: { filePath: 'config.txt' }, output: `value: ${secret}` };
       await afterCov({ tool: 'read', sessionID: subSessionCov }, output);
       if (!output.output.includes('REDACTED')) {
-        throw new Error(`atteso REDACTED per ${name}, trovato: ${output.output}`);
+        throw new Error(`expected REDACTED for ${name}, found: ${output.output}`);
       }
     });
   }
 }
 
-console.log('--- 20. SECRETS SENZA SLASH: nomi file bare (credentials, id_rsa) ---');
+console.log('--- 20. SLASHLESS SECRETS: bare file names (credentials, id_rsa) ---');
 {
-  const sess = await delegateAndCrystallize('executor', 'domain:implementation - test bare secrets', 'domain:implementation causa root nota, test bare secrets');
-  await expectBlock('lettura di un file chiamato esattamente "credentials" bloccata', () =>
+  const sess = await delegateAndCrystallize('executor', 'domain:implementation - test bare secrets', 'domain:implementation root cause known, test bare secrets');
+  await expectBlock('reading a file named exactly "credentials" blocked', () =>
     call('read', sess, { filePath: 'credentials' }));
-  await expectBlock('lettura di "id_rsa" bare (nessun prefisso .ssh/) bloccata', () =>
+  await expectBlock('reading bare "id_rsa" (no .ssh/ prefix) blocked', () =>
     call('read', sess, { filePath: 'id_rsa' }));
-  await expectPass('lettura di "credentialsfile.txt" NON bloccata (nessun falso positivo)', () =>
+  await expectPass('reading "credentialsfile.txt" NOT blocked (no false positive)', () =>
     call('read', sess, { filePath: 'credentialsfile.txt' }));
-  await expectPass('lettura di "id_token" (termine OIDC comune) NON bloccata', () =>
+  await expectPass('reading "id_token" (common OIDC term) NOT blocked', () =>
     call('read', sess, { filePath: 'id_token' }));
 
-  // Incidente reale 2026-08-25: "private" come cartella dentro node_modules —
-  // React Native ships node_modules/react-native/src/private/... — bloccato dal
-  // pattern secrets_directory nonostante non abbia nulla a che fare coi secret.
-  await expectPass('Test-Path su node_modules/.../src/private/... NON bloccato', () =>
+  // Real incident on 2026-08-25: "private" as a folder inside node_modules —
+  // React Native ships node_modules/react-native/src/private/... — blocked by the
+  // secrets_directory pattern despite having nothing to do with secrets.
+  await expectPass('Test-Path on node_modules/.../src/private/... NOT blocked', () =>
     call('bash', sess, { command: 'Test-Path node_modules/react-native/src/private/devsupport/devmenu/DevMenu.js' }));
-  await expectPass('lettura diretta di un file dentro node_modules/.../private/ NON bloccata', () =>
+  await expectPass('direct read of a file inside node_modules/.../private/ NOT blocked', () =>
     call('read', sess, { filePath: 'node_modules/some-pkg/private/index.js' }));
-  // Regressione: "private"/"secrets"/"credentials" nel PROGETTO (fuori da
-  // node_modules) restano bloccati — l'esclusione è specifica alle dipendenze.
-  await expectBlock('cartella "private" nel progetto (non in node_modules) resta bloccata', () =>
+  // Regression: "private"/"secrets"/"credentials" in the PROJECT (outside
+  // node_modules) stay blocked — the exclusion is specific to dependencies.
+  await expectBlock('"private" folder in the project (not in node_modules) stays blocked', () =>
     call('read', sess, { filePath: 'app/private/user-notes.md' }));
 }
 
-console.log('--- 21. TOOL MCP SCONOSCIUTI: solo osservabilità, nessun blocco (decisione esplicita 2026-08-25) ---');
+console.log('--- 21. UNKNOWN MCP TOOLS: observability only, no blocking (explicit 2026-08-25 decision) ---');
 {
-  // FINDING non risolto (deliberatamente, su scelta dell'utente): un tool MCP con
-  // nome dinamico (es. supabase_apply_migration) non passa da NESSUN check di
-  // permesso — bashAllowlist/readOnlyDespiteFullBash/allowEdit/writeScope non si
-  // applicano. Il fix scelto è solo logging (persistAuditEvent 'mcp_tool_usage'),
-  // per capire l'ampiezza reale dell'uso prima di scegliere una policy di
-  // enforcement. Questo test blocca il comportamento ATTUALE (pass-through per
-  // TUTTI gli agenti, inclusi quelli più ristretti) — se in futuro si decide di
-  // aggiungere enforcement, questo test va aggiornato di conseguenza, non è una
-  // garanzia di sicurezza.
+  // FINDING left open (deliberately, per user choice): an MCP tool with a
+  // dynamic name (e.g. supabase_apply_migration) goes through NO permission
+  // check — bashAllowlist/readOnlyDespiteFullBash/allowEdit/writeScope do not
+  // apply. The chosen fix is logging only (persistAuditEvent 'mcp_tool_usage'),
+  // to gauge the real usage breadth before choosing an enforcement
+  // policy. This test pins the CURRENT behavior (pass-through for
+  // ALL agents, including the most restricted ones) — if enforcement is added
+  // later, this test must be updated accordingly; it is not a
+  // security guarantee.
   const guardMcp = await DelegationGuard({
     project: { id: 'test-project-mcp-observability' }, client: mockClient, $: async () => {},
-    directory: '/home/claude/fake-project-mcp-observability', worktree: '/'
+    directory: projectRoot('mcp-observability'), worktree: projectRoot('mcp-observability')
   });
   const beforeMcp = guardMcp['tool.execute.before'];
   const eventMcp = guardMcp['event'];
@@ -901,7 +923,7 @@ console.log('--- 21. TOOL MCP SCONOSCIUTI: solo osservabilità, nessun blocco (d
   for (const agent of ['tester', 'verifier', 'debugger']) {
     const sess = `ses_sub_mcp_${agent}`;
     await eventMcp({ event: { type: 'session.created', properties: { sessionID: sess, info: { agent, parentID: 'ses_orch_mcp_observability' } } } });
-    await expectPass(`tool MCP sconosciuto passa senza blocco per "${agent}" (deny-totale/readOnly, comportamento attuale documentato)`, () => {
+    await expectPass(`unknown MCP tool passes without blocking for "${agent}" (deny-all/readOnly, current documented behavior)`, () => {
       callID++;
       return beforeMcp(
         { tool: 'supabase_apply_migration', sessionID: sess, callID: 'call_' + callID, args: { project_id: 'x', name: 'y', query: 'DROP TABLE users;' } },
@@ -911,8 +933,8 @@ console.log('--- 21. TOOL MCP SCONOSCIUTI: solo osservabilità, nessun blocco (d
   }
 }
 
-console.log(`\n=== RISULTATI: ${pass} passati, ${fail} falliti su ${pass+fail} test ===\n`);
+console.log(`\n=== RESULTS: ${pass} passed, ${fail} failed out of ${pass+fail} tests ===\n`);
 if (failures.length) {
-  console.log('FALLIMENTI:');
+  console.log('FAILURES:');
   failures.forEach(f => console.log(' -', f));
 }

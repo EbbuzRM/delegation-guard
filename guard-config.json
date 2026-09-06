@@ -1,7 +1,7 @@
 {
   "agentProfiles": {
     "codebase-mapper": {
-      "role": "mappatura codebase",
+      "role": "codebase mapping",
       "allowEdit": false,
       "bashAllowlist": [
         "*"
@@ -38,7 +38,7 @@
       "readOnlyDespiteFullBash": true
     },
     "code-reviewer": {
-      "role": "analisi codice",
+      "role": "code analysis",
       "allowEdit": false,
       "bashAllowlist": [
         "*"
@@ -73,7 +73,7 @@
       "readOnlyDespiteFullBash": true
     },
     "debugger": {
-      "role": "diagnosi",
+      "role": "diagnosis",
       "allowEdit": false,
       "bashAllowlist": [
         "*"
@@ -112,7 +112,7 @@
       "readOnlyDespiteFullBash": true
     },
     "doc-writer": {
-      "role": "documentazione",
+      "role": "documentation",
       "allowEdit": true,
       "bashAllowlist": [],
       "canWebfetch": false,
@@ -149,7 +149,7 @@
       }
     },
     "executor": {
-      "role": "implementazione",
+      "role": "implementation",
       "allowEdit": true,
       "bashAllowlist": [
         "*"
@@ -184,7 +184,7 @@
       "noTestExecution": true
     },
     "explorer": {
-      "role": "ricerca",
+      "role": "research",
       "allowEdit": false,
       "bashAllowlist": [
         "*"
@@ -259,7 +259,7 @@
       "readOnlyDespiteFullBash": true
     },
     "sketcher": {
-      "role": "prototipi UI",
+      "role": "UI prototypes",
       "allowEdit": true,
       "bashAllowlist": [],
       "canWebfetch": false,
@@ -295,7 +295,7 @@
       }
     },
     "spiker": {
-      "role": "prototipi throwaway",
+      "role": "throwaway prototypes",
       "allowEdit": true,
       "bashAllowlist": [
         "*"
@@ -329,7 +329,7 @@
       }
     },
     "tester": {
-      "role": "scrittura test",
+      "role": "test writing",
       "allowEdit": true,
       "bashAllowlist": [],
       "canWebfetch": false,
@@ -363,7 +363,7 @@
       }
     },
     "verifier": {
-      "role": "validazione",
+      "role": "validation",
       "allowEdit": false,
       "bashAllowlist": [
         "*"
