@@ -1,5 +1,5 @@
 ---
-description: Main OpenCode orchestrator. Orchestra director that delegates tasks to specialized subagents. Follows conductor-rules.
+description: "Main OpenCode orchestrator. Orchestra director that delegates tasks to specialized subagents. Follows conductor-rules."
 mode: primary
 permission:
   read: deny

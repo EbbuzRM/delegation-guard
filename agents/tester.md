@@ -1,5 +1,5 @@
 ---
-description: Unit and integration test authoring. Creates test coverage for components, hooks, services, and utilities. Never runs tests — writes them and hands them to verifier.
+description: "Unit and integration test authoring. Creates test coverage for components, hooks, services, and utilities. Never runs tests - writes them and hands them to verifier."
 mode: subagent
 permission:
   read: allow

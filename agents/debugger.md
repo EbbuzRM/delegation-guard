@@ -1,5 +1,5 @@
 ---
-description: Systematic debugging with the scientific method, hypotheses, tests, and verification. Analyzes bugs, stack traces, crashes, and unexpected behavior.
+description: "Systematic debugging with the scientific method, hypotheses, tests, and verification. Analyzes bugs, stack traces, crashes, and unexpected behavior."
 mode: subagent
 permission:
   read: allow

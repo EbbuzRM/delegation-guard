@@ -1,5 +1,5 @@
 ---
-description: Throwaway prototyping for feasibility tests. Creates disposable code in an isolated directory to validate ideas, libraries, and approaches.
+description: "Throwaway prototyping for feasibility tests. Creates disposable code in an isolated directory to validate ideas, libraries, and approaches."
 mode: subagent
 permission:
   read: allow

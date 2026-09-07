@@ -1,5 +1,5 @@
 ---
-description: Focused security audit. Verifies threat mitigations, identifies vulnerabilities, and provides concrete remediation.
+description: "Focused security audit. Verifies threat mitigations, identifies vulnerabilities, and provides concrete remediation."
 mode: subagent
 permission:
   read: allow

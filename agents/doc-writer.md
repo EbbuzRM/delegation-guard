@@ -1,5 +1,5 @@
 ---
-description: Writes and updates project documentation. README, architecture, API docs, runbooks, technical guides.
+description: "Writes and updates project documentation. README, architecture, API docs, runbooks, technical guides."
 mode: subagent
 permission:
   read: allow

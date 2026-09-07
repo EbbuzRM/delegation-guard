@@ -1,5 +1,5 @@
 ---
-description: Static UI/UX prototyping. Creates mockups, wireframes, and visual prototypes without touching the real frontend.
+description: "Static UI/UX prototyping. Creates mockups, wireframes, and visual prototypes without touching the real frontend."
 mode: subagent
 permission:
   read: allow

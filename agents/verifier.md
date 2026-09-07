@@ -1,5 +1,5 @@
 ---
-description: Code verification in two mandatory sequential phases — spec compliance first, then code quality. Use after every implementation or fix, or when the user asks for an explicit review.
+description: "Code verification in two mandatory sequential phases - spec compliance first, then code quality. Use after every implementation or fix, or when the user asks for an explicit review."
 mode: subagent
 permission:
   read: allow

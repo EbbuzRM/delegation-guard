@@ -1,5 +1,5 @@
 ---
-description: Executes plans and tasks with atomic commits, checkpoints, and deviation handling. Follows project best practices and orchestrator instructions.
+description: "Executes plans and tasks with atomic commits, checkpoints, and deviation handling. Follows project best practices and orchestrator instructions."
 mode: subagent
 permission:
   read: allow

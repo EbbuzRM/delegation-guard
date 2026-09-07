@@ -1,5 +1,5 @@
 ---
-description: Explores and analyzes the codebase. Produces structured documentation on tech stack, architecture, patterns, and quality.
+description: "Explores and analyzes the codebase. Produces structured documentation on tech stack, architecture, patterns, and quality."
 mode: subagent
 permission:
   read: allow

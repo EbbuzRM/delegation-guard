@@ -1,5 +1,5 @@
 ---
-description: Explores the codebase to answer questions, analyze structure, and provide context for other delegations.
+description: "Explores the codebase to answer questions, analyze structure, and provide context for other delegations."
 mode: subagent
 permission:
   read: allow
