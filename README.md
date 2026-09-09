@@ -1,508 +1,233 @@
 # Delegation Guard
 
-> Deterministic security middleware for OpenCode multi-agent orchestration.  
-> **Zero LLM dependencies.** Every rule is a pure function, testable in isolation.
+Deterministic security middleware for [OpenCode](https://opencode.ai/) multi-agent orchestration. Zero LLM dependencies -- every rule is a pure function.
 
----
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-## 📑 Table of Contents
+Also serves as a workaround for several OpenCode bugs.
 
-- [Overview](#overview)
-- [Features](#features)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-  - [Default Agents](#default-agents)
-  - [Adding a Custom Agent](#adding-a-custom-agent)
-  - [Custom Paths](#custom-paths)
-- [Core Security Pillars](#-core-security-pillars)
-  - [Anti-Loop Guard](#anti-loop-guard)
-  - [Sensitive File Protection](#sensitive-file-protection)
-  - [Bash Allowlists](#bash-allowlists)
-  - [Workflow Enforcement](#workflow-enforcement)
-  - [Routing Guard & Delegation Rules](#routing-guard--delegation-rules)
-  - [Edit Guard](#edit-guard)
-  - [Write Guard](#write-guard)
-  - [Webfetch Guard](#webfetch-guard)
-  - [Secret Detection](#secret-detection)
-- [Identity Resolution](#-identity-resolution)
-  - [Crystallization](#crystallization)
-  - [Cross-Type Parallelism Protection](#cross-type-parallelism-protection)
-  - [Gray Zone](#gray-zone)
-  - [Orchestrator](#orchestrator)
-- [Agent Profiles](#-agent-profiles)
-  - [Full Agent Table](#full-agent-table)
-  - [Delegation Rules per Agent](#delegation-rules-per-agent)
-- [Observability](#-observability)
-  - [Log Files](#log-files)
-  - [Audit Event Schema](#audit-event-schema)
-  - [Incident Tracking](#incident-tracking)
-  - [TUI Notifications](#tui-notifications)
-- [Key Runtime Log Patterns](#-key-runtime-log-patterns)
-- [Known Limitations](#-known-limitations)
-- [Testing](#-testing)
-- [Contributing](#-contributing)
+> **What this is -- and what it is NOT.** Delegation Guard is a deterministic policy-enforcement layer. It is **not** a sandbox, credential store, or complete secret scanner. Post-execution redaction (via `tool.execute.after`) cannot undo a tool action that already ran. Trusted agents -- those with `canDelegateTo: ["*"]`, currently `executor` and `spiker` -- are exempt from output scanning by design. The guard's own source, configuration, and test files are excluded from scanning because they contain textual pattern examples; treat them as untrusted input. See [SECURITY.md](docs/SECURITY.md) for full caveats.
 
----
+| Without the guard | With Delegation Guard |
+|---|---|
+| No enforcement layer for credential-path access by default | Sensitive-file blocks apply to read, grep, glob, edit, write, and bash |
+| Agent delegates in a loop forever / cross-type parallel collisions | Anti-loop limits + parallelism rules |
+| File changes follow ad-hoc permission prompts and session settings -- no fixed per-agent policy | Per-agent write scope + edit guard enforced on every call |
+| Secrets leak into tool output | Redaction on non-trusted output |
+| No trace of why a tool call happened | JSONL audit trail + denied-event registry |
 
-## Overview
+## Quick Start
 
-**Delegation Guard** is a fully deterministic security middleware designed for OpenCode multi-agent orchestration. It acts as a protective layer between OpenCode and its agents, enforcing strict security policies, routing rules, and workflow constraints — without relying on any LLM.
+### 30-second flow
 
-Every guard rule is implemented as a **pure function**, making the system:
-- ✅ **Deterministic** — same input always yields same output
-- ✅ **Testable** — each rule can be unit-tested in isolation
-- ✅ **Auditable** — every decision is logged with full traceability
+1. **Prerequisites:** Node.js (any recent version supporting ES module `import`) and [OpenCode](https://opencode.ai/) with plugin support enabled.
+2. Follow [Installation from source](#installation-from-source) for the complete setup.
+3. From the repository, run `node test-harness2.mjs` to verify the guard in isolation (no OpenCode required). Expected result: 21 suites, 92 assertions, all passing.
+4. Restart OpenCode after installation. The guard is live.
 
-> 🔧 **Note:** This project also serves as a workaround for several bugs in the OpenCode platform.
+## What it protects
 
----
+- **Routing and domain enforcement** -- agent identity resolution, delegation rules, anti-loop limits, and cross-type parallelism restrictions.
+- **Per-agent policies** -- edit permissions, write-scope boundaries, bash command allowlists, web-fetch access, and test-execution gating.
+- **Sensitive-file protection** -- blocks read, grep, glob, edit, write, and bash access to credential paths (`.env`, SSH keys, cloud credential files, etc.) while allowing conventional placeholders like `.env.example`.
+- **Secret detection and redaction** -- scans non-trusted agent output for known credential patterns (GitHub, AWS, OpenAI, Slack, Google, private keys, JWT, and more) and redacts matches in returned objects.
+- **Audit trail** -- JSONL audit events, denied-event registry (`INCIDENTS.md`), incident counters, repeated-incident lessons, and runtime diagnostics across plugin and project directories.
+- **Workflow prerequisites** -- enforces diagnostic-before-executor and verifier-after-executor sequences, plus a conductor-rules gate before the first delegation.
 
-## Features
+## How it works
 
-| Feature | Description |
-|---------|-------------|
-| 🔒 **Deterministic Security** | No LLM involvement — pure function-based rule enforcement |
-| 🛡️ **Multi-Layer Protection** | Anti-loop, sensitive file, bash, edit, write, webfetch guards |
-| 🧭 **Smart Routing** | Domain-based task routing with delegation rules |
-| 🔍 **Secret Detection** | Active redaction of credentials in tool outputs |
-| 📊 **Full Observability** | Structured audit trails, incident tracking, real-time notifications |
-| 🧪 **Comprehensive Testing** | 45 automated scenarios covering all guard behaviors |
+```
+Agent tool call
+       |
+       v
+ Resolve identity (session -> agent profile)
+       |
+       v
+ +---------------------+
+ | Guard checks:       |
+ | - Routing / domain  |
+ | - Workflow phase    |
+ | - Sensitive file    |
+ | - Bash allowlist    |
+ | - Edit / write      |
+ | - Web fetch         |
+ | - Scope boundary    |
+ +---------------------+
+       |
+  +---------+---------+
+  |         |         |
+  v         v         v
+ Allow    Block    Redact output
+  |         |         |
+  v         v         v
+ Tool runs  Error   Tool runs + secrets removed
+  |         |         |
+  +---------+---------+
+            |
+            v
+     Audit log (JSONL)
+```
 
----
+## Installation from source
 
-## Installation
+### 1. Clone
 
-1. Clone the repository:
 ```bash
 git clone https://github.com/EbbuzRM/delegation-guard.git
 cd delegation-guard
 ```
 
-2. Copy the default configuration and install the guard script as an OpenCode plugin:
+### 2. Install plugin, configuration, and agent profiles
 
-   **Unix / macOS:**
-   ```bash
-   mkdir -p ~/.config/opencode/plugins/delegation-guard
-   cp delegation-guard.js ~/.config/opencode/plugins/delegation-guard/
-   cp  guard-config.json  ~/.config/opencode/plugins/delegation-guard/
-   ```
+**Unix/macOS:**
 
-   **Windows (PowerShell):**
-   ```powershell
-   New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.config\opencode\plugins\delegation-guard" | Out-Null
-   Copy-Item guard-config.json "$env:USERPROFILE\.config\opencode\plugins\delegation-guard\"
-   Copy-Item delegation-guard.js "$env:USERPROFILE\.config\opencode\plugins\delegation-guard\"
-   ```
-
-3. Ensure the guard is loaded by OpenCode as a plugin (see [OpenCode plugin documentation](https://docs.opencode.ai/plugins)).
-
----
-
-## Quick Start
-
-1. **Review the default configuration** in `guard-config.json` — it ships with a full set of pre-configured agents.
-
-2. **Run the test harness** to verify everything works:
 ```bash
-node test-harness2.mjs
+mkdir -p ~/.config/opencode/plugins/delegation-guard ~/.config/opencode/agents
+cp delegation-guard.js guard-config.json ~/.config/opencode/plugins/delegation-guard/
+cp agents/*.md ~/.config/opencode/agents/
 ```
 
-3. **Start OpenCode** — the guard will automatically intercept and validate all agent tool calls.
+**Windows PowerShell:**
 
----
+```powershell
+$plugin = "$env:USERPROFILE\.config\opencode\plugins\delegation-guard"
+$agents = "$env:USERPROFILE\.config\opencode\agents"
+New-Item -ItemType Directory -Force -Path $plugin, $agents | Out-Null
+Copy-Item delegation-guard.js, guard-config.json $plugin
+Copy-Item agents\*.md $agents
+```
 
-## Configuration
+Keep each `agents/*.md` file. They define the agent identities that `guard-config.json` governs; copying only the plugin does not create those agents.
 
-All agent permissions and routing rules are centralized in `guard-config.json`. Native OpenCode agent profiles (`.config/opencode/agents/*.md`) no longer contain bash permissions — everything is managed by the Guard.
+### 3. Install conductor-rules skill
 
-### Default Agents
+The guard blocks orchestration delegations unless the `conductor-rules` skill is available. Copy it to OpenCode's user skills directory (lowercase folder name):
 
-The default `guard-config.json` ships with pre-configured agents. Each agent profile includes:
+**Unix/macOS:**
+
+```bash
+mkdir -p ~/.config/opencode/skills/conductor-rules
+cp skill/Conductor-rules/SKILL.md ~/.config/opencode/skills/conductor-rules/
+```
+
+**Windows PowerShell:**
+
+```powershell
+$skill = "$env:USERPROFILE\.config\opencode\skills\conductor-rules"
+New-Item -ItemType Directory -Force -Path $skill | Out-Null
+Copy-Item skill\Conductor-rules\SKILL.md $skill
+```
+
+### 4. Enable the plugin in OpenCode
+
+Plugins placed in OpenCode's `~/.config/opencode/plugins/` directory may be auto-loaded. This source-install flow uses explicit `opencode.json` (or `opencode.jsonc`) registration for deterministic setup; add a `file:///` entry to the `plugin` array:
 
 ```json
 {
-  "delegation_rules": {
-    "can_handle_directly": ["implementation", "bugfix"],
-    "must_delegate_to": {
-      "verification": "verifier",
-      "testing": "tester"
+  "plugin": [
+    "file:///C:/Users/YOU/.config/opencode/plugins/delegation-guard/delegation-guard.js"
+  ]
+}
+```
+
+On Unix/macOS the path is:
+
+```json
+{
+  "plugin": [
+    "file:///home/YOU/.config/opencode/plugins/delegation-guard/delegation-guard.js"
+  ]
+}
+```
+
+Restart OpenCode after editing the config. See the [OpenCode plugin documentation](https://opencode.ai/docs/plugins/) for the full reference on local paths and npm-based plugins.
+
+## Prerequisites
+
+- Node.js (any recent version supporting ES module `import`)
+- [OpenCode](https://opencode.ai/) with plugin support enabled
+- The `conductor-rules` skill installed as described above
+- Agent profile `.md` files copied into the OpenCode `agents/` directory
+
+## Configuration
+
+Everything is centralized in `guard-config.json`. Each agent profile declares its permissions, delegation targets, write scope, and domain routing. Minimal custom-agent entry:
+
+```json
+{
+  "agentProfiles": {
+    "my-agent": {
+      "role": "custom role",
+      "allowEdit": false,
+      "bashAllowlist": [],
+      "canWebfetch": false,
+      "canDelegateTo": [],
+      "canPreDelegate": false,
+      "writeScope": "all",
+      "delegation_rules": {
+        "can_handle_directly": ["research"],
+        "must_delegate_to": {}
+      }
     }
   }
 }
 ```
 
-| Field | Description |
-|-------|-------------|
-| `can_handle_directly` | Domains this agent can process itself |
-| `must_delegate_to` | Domains that must be routed to a specific agent |
+The runtime deep-merges external profiles with its built-in fallback profiles; **arrays replace** inherited arrays (they do not concatenate). Add a matching `my-agent.md` under OpenCode's `agents/` directory.
 
-### Adding a Custom Agent
+For the full field reference, shipped-agent list, data paths, and defaults, see [docs/configuration.md](docs/configuration.md). To contribute, see [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
 
-Add a new entry to `guard-config.json`:
+## Examples
+
+### Blocked `.env` read
+
+When an agent attempts to read a sensitive file, the guard blocks the call and throws:
+
+```
+❌ SENSITIVE FILE: sensitive file access blocked for agent "executor". Tool: read, File: C:\App\project\.env, Pattern: env_files, Severity: critical
+```
+
+The same block applies to `grep`, `glob`, `edit`, `write`, and `bash` commands that reference credential paths (SSH keys, cloud credential files, etc.). Conventional placeholders like `.env.example` are allowed.
+
+### Audit event
+
+Every blocked call is written as a JSONL line to `.planning/audit/audit-YYYY-MM-DD.jsonl`:
 
 ```json
-"my-custom-agent": {
-  "role": "my custom role",
-  "allowEdit": true,
-  "bashAllowlist": ["npm *", "node *"],
-  "canWebfetch": false,
-  "canDelegateTo": ["explorer"],
-  "canPreDelegate": false,
-  "writeScope": "all",
-  "delegation_rules": {
-    "can_handle_directly": ["my_domain"],
-    "must_delegate_to": {}
-  }
-}
+{"timestamp":"2026-09-09T14:23:07.123+02:00","sessionId":"ses_abc123","eventType":"denied","agent":"executor","action":"blocked","details":{"check":"sensitive_file","error":"❌ SENSITIVE FILE: sensitive file access blocked for agent \"executor\". Tool: read, File: .env, Pattern: env_files, Severity: critical","filePath":".env","tool":"read"}}
 ```
 
-> ⚠️ **IMPORTANT:** Custom agents also require a matching OpenCode agent definition file in your `.config/opencode/agents/` directory. The guard config alone does not create the agent — it only defines its permissions and routing.
+Audit events use the schema `{ timestamp, sessionId, eventType, agent, action, details }` where `eventType` is one of `denied`, `delegation`, `webfetch`, `sensitive`, `secret`, or `mcp_tool_usage`, and `action` is one of `blocked`, `executed`, `allowed`, `observed`, or `redacted`. See [docs/configuration.md](docs/configuration.md) for the full field reference.
 
-### Custom Paths
+## Troubleshooting
 
-The guard uses several relative paths for logging and audit trails. All paths are relative to the plugin directory (`__dirname`):
+**Delegations are blocked with a conductor-rules error.**
+Install the conductor-rules skill. See step 3 in [Installation from source](#installation-from-source). The skill must be in `~/.config/opencode/skills/conductor-rules/SKILL.md`.
 
-| Path | Purpose | Customizable |
-|------|---------|------------|
-| `.planning/guard-init.log` | Plugin bootstrap log | Yes — edit `initLogPath` in the factory |
-| `.planning/audit/audit-YYYY-MM-DD.jsonl` | Structured audit trail | Yes — edit audit path in the plugin |
-| `.planning/INCIDENTS.md` | Security block incidents (project dir) | Yes |
-| `delegation-guard/guard-debug.jsonl` | Full I/O debug log | Yes — edit debug path |
-| `delegation-guard-runtime.log` | Operational runtime log | Yes — edit `runtimeLogPath` |
-| `.opencode/metrics_count.json` | Incident counters (project dir) | Yes |
+**Agent keeps getting routing errors.**
+Every delegated task must declare a domain. Add `domain:<name>` to the task prompt (the alias `task_domain:<name>` is also accepted). The domain must match an entry in the agent's `can_handle_directly` list or its `must_delegate_to` map.
 
-To change these paths, edit the corresponding constants in `delegation-guard.js`.
+**Secrets visible in output anyway.**
+Output scanning is post-execution (`tool.execute.after`). The tool already ran; redaction only cleans the returned object. Check the audit log for what was captured, and keep credentials outside the worktree.
 
----
+**Guard not loading.**
+Ensure the plugin is listed in your OpenCode configuration and that `delegation-guard.js` and `guard-config.json` are in the plugin directory. Verify that agent `.md` files are in the OpenCode `agents/` directory.
 
-## 🛡️ Core Security Pillars
+## Limitations
 
-### Anti-Loop Guard
+- Routing is keyword/domain-based, not semantic.
+- `tool.execute.after` secret detection is post-execution; it can redact returned values but cannot undo a completed tool action.
+- Regex scanning covers known patterns only; it is not comprehensive secret scanning.
+- Guard state is process-local; delegation sequence state does not persist across a new guard instance.
+- OpenCode hook behavior can vary by version; compatibility follows the checked-in plugin API dependency.
 
-Prevents infinite delegation loops via four rules applied to the delegation stack:
+## Docs and contributing
 
-| Rule | Description |
-|------|-------------|
-| **Self-loop** | Blocks an agent delegating to itself |
-| **Ping-pong** | Blocks repeated 2-cycle (A→B→A→B), not single legitimate iteration |
-| **Saturation** | Same agent appears ≥4 times in the last 5 steps (backstop) |
-| **Max depth** | Stack exceeding 5 levels is blocked |
+- [Configuration and operations](docs/configuration.md) -- full field reference, data paths, defaults
+- [Security policy](docs/SECURITY.md) -- reporting, caveats, scope
+- [Contributing](docs/CONTRIBUTING.md) -- how to change the guard or documentation
+- [Issues](https://github.com/EbbuzRM/delegation-guard/issues) -- reproducible bugs and usage questions
 
-> ⏱️ **Note:** The Orchestrator is exempt from anti-loop checks as root of every delegation chain.
+## License
 
-### Sensitive File Protection
-
-Every read tool call (`read`, `grep`, `glob`) is intercepted before any other check. The Guard blocks access to:
-
-| Severity | Files / Patterns |
-|----------|------------------|
-| **Critical** | `.env`, `.env.*`, SSH keys (`~/.ssh/id_*`), `.pem` files, AWS/GCP/Azure credentials |
-| **High** | `secrets/`, `credentials/`, `private/` directories; `.p12`, `.pfx`, `.jks`, `.netrc`, `.git-credentials`, `.docker/config.json` |
-| **Medium** | `.npmrc` (may contain authentication tokens) |
-
-> 🔒 **IMPORTANT:** No agent is exempt — the block applies to all regardless of `bashAllowlist`. The exception allowing executor to access sensitive files was permanently removed (fix 2026-07-28).
-
-### Bash Allowlists
-
-Each agent has an allowed command pattern list following the principle of least privilege:
-
-| Agent | `bashAllowlist` | `readOnlyDespiteFullBash` | Notes |
-|-------|-----------------|------------------------|-------|
-| `executor` | `["*"]` | — | Full access; `noTestExecution: true` |
-| `verifier` | `["*"]` | ✅ | Test/lint only; no file mutations |
-| `spiker` | `["*"]` | — | Full access; write scope: `spikes/` |
-| `codebase-mapper` | `["*"]` | ✅ | Shell mutation blocked |
-| `code-reviewer` | `["*"]` | ✅ | Shell mutation blocked |
-| `debugger` | `["*"]` | ✅ | Shell mutation blocked; `canWebfetch` |
-| `explorer` | `["*"]` | ✅ | Shell mutation blocked; `canWebfetch` |
-| `security-auditor` | `["*"]` | ✅ | Shell mutation blocked |
-| `tester` | `[]` | — | Total deny |
-| `sketcher` | `[]` | — | Total deny |
-| `doc-writer` | `[]` | — | Total deny |
-
-**`readOnlyDespiteFullBash`**: blocks file-mutating bash commands (PowerShell `Set-Content`/`Add-Content`/`Out-File`/`Remove-Item`, Python `open('w')`, Node `fs.writeFileSync`, `sed -i`, `tee`, `rm`, etc.) even for agents with `bashAllowlist: ["*"]`. Exception: writing to temporary directories (`AppData\Local\Temp`, `/tmp/`, `$env:TEMP`) remains permitted.
-
-**`noTestExecution`**: blocks test execution (`npm test`, `pytest`, `jest`, `go test`, etc.) via bash. Active on `executor` — test execution is the `verifier`'s responsibility.
-
-**Additional bash protections:**
-- Recursive deletion on root, user, or Windows paths → **blocked**
-- `git push` with force flags on protected branches (`main`, `master`, `develop`, `release/*`) → **blocked**
-- `git add -f` with absolute path → **blocked**
-- Destructive system patterns (`format`, `diskpart`, recursive deletion) → **blocked**
-- Sensitive files accessible via shell (e.g., `Get-Content .env`) → **blocked for all agents**
-
-### Workflow Enforcement
-
-The Guard enforces a mandatory delegation sequence:
-
-1. **Diagnostic prerequisite**: `executor` requires a prior diagnostic agent (`debugger`, `explorer`, `codebase-mapper`) or a keyword/diagnostic file reference in the prompt.
-   - **Exceptions for routine operations**: `ota`, `update`, `deploy`, `publish`, `release`, `commit`, `push`.
-
-2. **Post-executor verifier**: after `executor`, the next agent must be:
-   - `verifier` — standard validation
-   - `executor` — parallel executor (Swarm Mode)
-   - `doc-writer` — documentation updates
-
-> **Note:** `verifier` and `doc-writer` may operate autonomously (no preceding `executor` required).
-
-3. **Conductor-rules gate**: the Orchestrator's first `task` (delegation) call is blocked until it has called `skill` with `conductor-rules` in that session (`isOrchestrator`-only — never applies to subagents, to avoid identity confusion where a subagent that loads the Orchestrator's rules starts believing it *is* the Orchestrator). The flag persists in `sessionState` for the rest of the session — not re-required every prompt.
-
-   > 🔁 **Restart-safe:** `sessionState` is an in-memory Map, cleared whenever the plugin process restarts (e.g. closing/reopening OpenCode). If the same session is resumed, the gate checks `client.session.messages()` for a prior `conductor-rules` load in that session's history before blocking, instead of forcing a redundant reload of rules already in context.
-
-### Routing Guard & Delegation Rules
-
-Every task must declare a domain in the prompt (`domain:<name>`). The Guard verifies the target agent can handle that domain:
-
-- If the agent can handle it directly → **permitted**
-- If it must delegate to another agent → **blocked with suggestion**
-- If domain is undeclared → **error "Task domain not declared"**
-
-**Recognized aliases:**
-- `architecture` → `architecture_analysis`
-- `security` → `security_audit`
-
-**Retry mechanism:** max 3 attempts per `(agent, domain)` pair, then escalation to manual intervention.
-
-**Documentation task detection:** if a non-`doc-writer` agent tries to edit `.md` or `.txt` files, the Guard blocks it automatically and suggests delegating to `doc-writer`. Detection uses three steps:
-1. Write verb in prompt
-2. Anti-code check — if prompt mentions code files, it's not a documentation task
-3. Verification of target `.md`/`.txt` files
-
-### Edit Guard
-
-Intercepts edit calls and enforces:
-
-- Verifies the agent profile allows edit
-- Orchestrator cannot edit files directly
-- Blocks changes in protected zones: `node_modules/`, `.git/`, `dist/`, `build/`
-- Blocks path traversal (e.g., `../../etc/passwd`)
-
-### Write Guard
-
-Intercepts write calls and enforces:
-
-- Same protected zones as Edit Guard
-- Blocks overwriting existing files (exceptions: `*.log`, `*.tmp`, `*.bak`)
-- Enforces per-agent write scope:
-  - `sketcher` → only `sketches/`, `mockups/`, `prototypes/`
-  - `spiker` → only `spikes/`, `experiments/`, `prototypes/`, `tmp/`, `sandbox/`
-
-**Repeated out-of-scope write escalation:** the first out-of-scope write attempt returns the generic `❌ SCOPE:` error (allows honest self-correction). A **second** attempt at the *identical* normalized path escalates to `❌ ROUTING: ... redelega a executor con domain:implementation` instead of repeating the same block indefinitely. This targets a real misuse pattern: a task mislabeled as `domain:feasibility_spike`/`domain:throwaway_prototype` to route it through `spiker`'s permissive profile (full bash/edit, none of `executor`'s workflow gates) and dodge the stricter `executor` checks — the Guard can't validate that a self-declared domain is *true*, only that writes stay inside the declared agent's scope, so persistence on the same forbidden target is the signal used instead. Tracking is per-session, keyed by `agent::normalizedPath` — an isolated typo on a *different* path never counts against a prior one.
-
-### Webfetch Guard
-
-Intercepts `webfetch` calls:
-
-- Only `http://` and `https://` schemes permitted
-- Orchestrator is always authorized
-- For other agents, must be enabled in profile (`canWebfetch: true`) or prompt must contain `"explicit user webfetch request"`
-- If identity is unknown (gray zone), webfetch is permitted but logged
-
-### Secret Detection
-
-After every tool call, the Guard scans output for credential patterns:
-
-| Severity | Patterns |
-|----------|----------|
-| **Critical** | GitHub PAT (`ghp_...`), AWS Access Key (`AKIA...`), private keys (RSA/EC/OPENSSH/DSA) |
-| **High** | URLs with credentials, Bearer tokens, Modal API keys, Supabase tokens, JWTs |
-| **Medium** | Generic API keys in JSON, private key file paths |
-
-When a secret is detected, the Guard **actively modifies** the output object, replacing all string fields with:
-
-```
-[REDACTED BY DELEGATION GUARD - SECURITY VIOLATION: SECRET DETECTED]
-```
-
-This is **active redaction**, not just logging.
-
-> **Note:** Trusted agents (with `canDelegateTo: ["*"]`, e.g., `executor` and `spiker`) are exempt as they handle credentials legitimately.
-
----
-
-## 🔍 Identity Resolution
-
-The Guard resolves agent identity at every tool call via a hierarchy:
-
-1. `input.__injectedAgent` (legacy)
-2. `global.currentActiveAgent` or `input.agent`
-3. `state.lastAgent` (per-session crystallized identity)
-
-### Crystallization
-
-When the Orchestrator delegates a task, the target agent is captured in `global.currentActiveAgent`. At the first non-task tool call of the subagent, the identity is crystallized into per-session state (`state.lastAgent`), isolating it from overwrites by subsequent delegations.
-
-### Cross-Type Parallelism Protection
-
-If the Orchestrator attempts to delegate to a different agent type while another is still pending crystallization, the Guard blocks the delegation with an explicit error. Same-type delegations (Swarm Mode) are always permitted — only cross-type parallel is serialized.
-
-> ⏱️ **Note:** The TTL for a pending uncrystallized agent is **15 seconds** (reduced from 60s on 2026-07-23 to avoid prolonged blocks during LLM outages).
-
-### Gray Zone
-
-If identity is unresolvable:
-
-- **Read-only tools** (`read`, `grep`, `glob`): permitted with warning
-- **Mutative tools** (`bash`, `edit`, `write`): permitted but logged. Downstream checks (allowlist, edit guard, write guard) apply only if they require a known profile.
-
-### Orchestrator
-
-The Orchestrator is detected by comparing the current session with `global.__orchestratorSessionID`. It may use `task` and `webfetch`/`websearch` without restrictions, but cannot directly use `glob`, `grep`, `read`, `sequential-thinking`, `todowrite`, `bash`, `edit`, `write` — it must delegate to a subagent.
-
----
-
-## 🤖 Agent Profiles
-
-### Full Agent Table
-
-| Agent | Role | `bashAllowlist` | `readOnly` | `canPreDelegate` | `writeScope` | `allowEdit` | `canWebfetch` | Notes |
-|-------|------|-----------------|------------|------------------|--------------|-------------|---------------|-------|
-| `codebase-mapper` | codebase mapping | `["*"]` | ✅ | `true` | `all` | `false` | `false` | Pre-delegation |
-| `code-reviewer` | code analysis | `["*"]` | ✅ | `false` | `all` | `false` | `false` | lint, tsc, typecheck |
-| `debugger` | diagnostics | `["*"]` | ✅ | `false` | `all` | `false` | `true` | canWebfetch for error lookups |
-| `doc-writer` | documentation | `[]` | — | `false` | `readme` | `true` | `false` | Deny bash; docs scope |
-| `executor` | implementation | `["*"]` | — | `false` | `all` | `true` | `true` | noTestExecution; verifier required after |
-| `explorer` | research | `["*"]` | ✅ | `true` | `planning` | `false` | `true` | Pre-delegation |
-| `security-auditor` | security audit | `["*"]` | ✅ | `false` | `all` | `false` | `false` | npm audit |
-| `sketcher` | UI prototypes | `[]` | — | `false` | `sketches` | `true` | `false` | Deny bash; sketches/mockups/prototypes only |
-| `spiker` | throwaway prototypes | `["*"]` | — | `false` | `spikes` | `true` | `false` | Full access; spikes/experiments/sandbox |
-| `tester` | test writing | `[]` | — | `false` | `all` | `true` | `false` | Deny bash; writes tests, does not run them |
-| `verifier` | validation | `["*"]` | ✅ | `false` | `all` | `false` | `false` | Test/lint only; no mutations |
-
-> `readOnly` = `readOnlyDespiteFullBash` — shell mutation blocked even with full bash.
-
-> **Note:** Configuration is centralized in `guard-config.json`. Native OpenCode profiles (`.config/opencode/agents/*.md`) no longer contain bash permissions — everything is managed by the Guard.
-
-### Delegation Rules per Agent
-
-Each agent profile defines `delegation_rules` with:
-
-- `can_handle_directly`: domains the agent can process directly
-- `must_delegate_to`: domains that must be delegated to another agent
-
-**Example (executor):**
-
-```json
-"delegation_rules": {
-  "can_handle_directly": ["implementation", "refactor", "bugfix", "deployment", "configuration"],
-  "must_delegate_to": {
-    "verification": "verifier",
-    "testing": "tester",
-    "documentation": "doc-writer",
-    "debugging": "debugger"
-  }
-}
-```
-
----
-
-## 📊 Observability
-
-### Log Files
-
-| File | Purpose | Location |
-|------|---------|----------|
-| `guard-init.log` | Plugin bootstrap | `.planning/` (relative to `__dirname`) |
-| `guard-debug.jsonl` | Full I/O debug | `delegation-guard/` (relative to `__dirname`) |
-| `delegation-guard-runtime.log` | Operational monitoring | Plugin directory (`__dirname`) |
-| `audit-YYYY-MM-DD.jsonl` | Structured audit trail | `.planning/audit/` (relative to `__dirname`) |
-| `INCIDENTS.md` | Security block registry | `.planning/` in project directory |
-| `LESSONS.md` | Recurring patterns (≥2 incidents) | `~/.config/opencode/` |
-| `metrics_count.json` | Incident counters by type | `.opencode/` in project directory |
-
-### Audit Event Schema
-
-```json
-{
-  "timestamp": "2026-06-29T10:30:00.000+02:00",
-  "sessionId": "...",
-  "eventType": "denied|delegation|secret|sensitive|webfetch",
-  "agent": "executor",
-  "action": "blocked|allowed|executed",
-  "details": { ... }
-}
-```
-
-### Incident Tracking
-
-Every denied event (security block) triggers `handleDeniedEvent()` which:
-
-1. Writes a line to `.planning/INCIDENTS.md` in the project directory with:
-   - Progressive ID (`INC-NNNN`)
-   - Check name
-   - Date
-   - Agent
-   - Reason
-
-2. Updates counters in `.opencode/metrics_count.json`
-
-3. If the same incident type (`agent` + `check`) repeats ≥2 times, writes a "lesson" to `~/.config/opencode/LESSONS.md` for cross-project persistent memory
-
-> **Note:** Persistence is skipped if `_projectDirectory` is empty or points to `.opencode/plugins` (unreliable contexts).
-
-### TUI Notifications
-
-Every blocked action displays a real-time error toast in the OpenCode interface, showing:
-- Check name
-- Agent name
-- First line of the block reason
-
----
-
-## 📝 Key Runtime Log Patterns
-
-| Pattern | Meaning |
-|---------|---------|
-| `IDENTITY LOCK: session=... -> agent` | Identity crystallized for a session |
-| `GRAY ZONE: tool "..." permitted` | Unknown identity, tool permitted in safe mode |
-| `WORKFLOW CHECK PASSED: agent=...` | Workflow validation passed |
-| `blocked: agent=..., check=..., reason=...` | Security block with details |
-| `CLEANUP: global sequence reset` | Orchestrator session terminated |
-
----
-
-## ⚠️ Known Limitations
-
-| Limitation | Cause | Status |
-|------------|-------|--------|
-| `tool.execute.before` doesn't fire for subagent tool calls | OpenCode Bug | Workaround: identity crystallization |
-| `delegationSequence` resets on new guard instance | State in `createDelegationGuard()` closure | SQLite persistence planned |
-| Routing based on keywords, not semantic | Design choice | Deliberate — ensures determinism |
-
----
-
-## 🧪 Testing
-
-Check functions are private to the plugin closure — no named exports. Tests verify behavior via the public API (`DelegationGuard` factory) by instantiating the guard with a mock client and simulating tool calls through the `tool.execute.before` hook.
-
-`test-harness2.mjs` is included in this repository and covers **10 main suites**:
-
-1. Routing / domain declaration
-2. Workflow sequence (fix requires diagnosis)
-3. Sensitive file protection (read/grep/glob/edit/write/bash)
-4. No test execution for executor
-5. Shell mutation for `readOnlyDespiteFullBash` agents
-6. Orchestrator tool restrictions
-7. Swarm Mode — same-type parallel OK, cross-type blocked
-8. Orchestrator hijack guard (subagent auto-delegation before crystallization)
-9. Conductor-rules gate (skill must be loaded before first delegation, including restart-safe history check)
-10. Scope violation repeat-target escalation (repeated out-of-scope writes to the same path escalate to an executor redirect)
-
-### Running Tests
-
-```bash
-node test-harness2.mjs
-```
-
-The test harness imports from `./delegation-guard.js` — make sure the path matches your setup.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
----
-
-*Built with 💻 and ☕ for secure multi-agent orchestration.*
+[MIT](./LICENSE)
