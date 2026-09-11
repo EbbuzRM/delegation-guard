@@ -19,6 +19,7 @@ Profile fields:
 | `bashAllowlist` | string[] | Allowed command patterns; `[]` denies shell commands. |
 | `canWebfetch` | boolean | Enables web fetch for profile. |
 | `canDelegateTo` | string[] | Allowed delegation targets; `*` permits all configured targets. |
+| `trustedForSecrets` | boolean | When `true`, this agent's output skips secret redaction (`checkSecretsInOutput`). Default `false`. Explicit config only, never derived from `canDelegateTo`; the fallback safety-net never sets it (fail-closed). Currently enabled only for `executor` and `spiker`. |
 | `canPreDelegate` | boolean | Allows pre-delegation behavior. |
 | `writeScope` | string | Scope label such as `all`, `planning`, `readme`, `sketches`, or `spikes`. |
 | `readOnlyDespiteFullBash` | boolean | Blocks mutating shell commands despite `bashAllowlist: ["*"]`. |
@@ -49,13 +50,13 @@ The matching definitions are in [`agents/`](../agents/): `codebase-mapper`, `cod
 
 | Path | Purpose |
 |---|---|
-| `delegation-guard-runtime.log` | Runtime diagnostics next to plugin file. |
+| `delegation-guard-runtime.log` | Runtime diagnostics next to plugin file. Truncated to 1 MB on plugin load. |
 | `.planning/audit/audit-YYYY-MM-DD.jsonl` | Structured audit events next to plugin file. |
 | `.planning/INCIDENTS.md` | Denied-event registry in project directory. |
 | `.opencode/metrics_count.json` | Incident counters in project directory. |
+| `.planning/LESSONS.md` | Repeated incident lessons in project directory (was `~/.config/opencode/LESSONS.md` before 2026-09-11; the old homedir file is not migrated). |
 | `.planning/guard-init.log` | Plugin startup diagnostics next to plugin file. |
-| `delegation-guard/guard-debug.jsonl` | Per-tool-call debug trace next to plugin file. |
-| `~/.config/opencode/LESSONS.md` | Repeated incident lessons. |
+| `delegation-guard/guard-debug.jsonl` | Per-tool-call debug trace next to plugin file. Opt-in: written only when the environment variable `OPENCODE_GUARD_DEBUG=1` is set. |
 
 Audit events contain timestamp, session ID, event type, agent, action, and optional details. Audit I/O failures are logged and do not block the guard.
 

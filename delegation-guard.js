@@ -1,7 +1,6 @@
 // @ts-check
 import path from 'node:path'
-import os from 'node:os'
-import { appendFileSync, existsSync, mkdirSync, writeFileSync, readFileSync, statSync, renameSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, writeFileSync, readFileSync, statSync, renameSync, truncateSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 
@@ -87,9 +86,12 @@ function tryLoadGuardConfig(projectDir) {
 /**
  * Loads and caches agent profiles.
  * If external loading fails, uses the fallback and logs the error.
- * If external loading succeeds, does a deep merge of the fallback
- * (preserving neverDo, keywords, allowMentions from the fallback)
- * then overrides with explicit external values.
+  * If external loading succeeds, does a deep merge: the MINIMAL safety-net
+  * fallback is the base, explicit external values override. The full
+  * policy (neverDo, keywords, allowMentions, allowlists, scopes) lives in
+  * guard-config.json — the fallback only fills structural gaps when the
+  * external config omits a field, and takes over entirely (fail-closed on
+  * mutative capabilities) when the config is missing.
  *
  * @param {string | undefined} projectDir
  * @returns {Record<string, any>}
@@ -134,16 +136,17 @@ function loadAgentProfiles(projectDir) {
   const external = tryLoadGuardConfig(projectDir)
 
   if (!external) {
-    console.error('[Guard] guard-config.json not found in any location — using hardcoded fallback')
+    console.error('[Guard] guard-config.json not found in any location — using MINIMAL safety-net fallback (bash/webfetch/sub-delegation: total deny)')
     _cachedAgentProfiles = fallback
     _cachedConfigSource = null
     _cachedConfigMtime = null
     return _cachedAgentProfiles
   }
 
-  // Deep merge: fallback as base, external overrides explicit fields.
-  // This preserves neverDo/keywords/allowMentions from the fallback when
-  // the external config does not define them (e.g. codebase-mapper in external config).
+  // Deep merge: minimal safety-net fallback as base, external config overrides
+  // explicit fields. guard-config.json is the single source of truth for the
+  // full policy; the fallback only fills gaps for fields the external config
+  // omits (it defines no policy itself — M2 2026-09-10).
   for (const agentKey of Object.keys(fallback)) {
     if (external.profiles[agentKey]) {
       deepMerge(fallback[agentKey], external.profiles[agentKey])
@@ -174,6 +177,17 @@ function runtimeLog(message) {
   } catch (e) {
     // Diagnostic logging must never affect the guard.
   }
+}
+
+// Cap the runtime log at plugin load: if it exceeds 1MB, truncate it to 1MB.
+// Diagnostic hygiene only — a failure here must never break the guard.
+try {
+  const RUNTIME_LOG_CAP_BYTES = 1024 * 1024
+  if (existsSync(runtimeLogPath) && statSync(runtimeLogPath).size > RUNTIME_LOG_CAP_BYTES) {
+    truncateSync(runtimeLogPath, RUNTIME_LOG_CAP_BYTES)
+  }
+} catch (e) {
+  // Silently fail: log capping must never affect the guard.
 }
 
 runtimeLog('DelegationGuard module loaded')
@@ -532,6 +546,24 @@ const workflowRules = {
 }
 
 /**
+ * Extracts the task delegation target agent from the hook arguments.
+ * VER-LOW-02 (2026-09-11): the arming block read both sources
+ * (output?.args?.subagent_type || input.args?.subagent_type) while the task
+ * handler read ONLY output.args — a delegation carrying subagent_type in
+ * input.args alone armed the identity bridge and then hit the handler's
+ * early return with NO validation and NO rollback (TTL-bounded residue in
+ * pendingAgentTypes + currentActiveAgent). Single shared extractor: both
+ * sites now resolve the SAME value, so a delegation is either validated
+ * and rolled back on failure, or never armed at all (both sources absent).
+ * @param {object} input - hook input ({ tool, sessionID, callID, args? })
+ * @param {object} output - hook output ({ args? })
+ * @returns {string|undefined} the subagent_type, if any
+ */
+function extractTargetAgent(input, output) {
+  return output?.args?.subagent_type || input?.args?.subagent_type;
+}
+
+/**
  * Detects whether the task concerns writing/updating documentation.
  * @param {string} fullText - The full prompt
  * @returns {boolean} true if the task is documentation
@@ -584,6 +616,15 @@ function checkDelegationRules(agent, profile, fullText, allProfiles) {
   const declaredDomain = domainAliases[rawDomain] || rawDomain
 
   const rules = profile.delegation_rules
+
+  // M2/REV-03 (2026-09-10): wildcard support — can_handle_directly ['*'] means
+  // "any domain directly". Used by the minimal safety-net fallback so a
+  // missing guard-config.json does not brick all delegations (fail-operational
+  // for routing; every mutative permission stays fail-closed). No agent in
+  // guard-config.json uses '*', so config-driven behavior is unchanged.
+  if (Array.isArray(rules.can_handle_directly) && rules.can_handle_directly.includes('*')) {
+    return
+  }
 
   // If the agent can handle this domain directly → OK
   if (Array.isArray(rules.can_handle_directly) && rules.can_handle_directly.includes(declaredDomain)) {
@@ -816,12 +857,35 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
   // key, so multiple parallel executors do not count as a conflict.
   const PENDING_TTL_MS = 15000; // 15s: lowered from 60s (fix 2026-07-23) because an LLM outage left pending stuck uselessly
 
-  // Identity bridge: workaround for OpenCode bug #5894 (tool.execute.before not
-  // propagating subagent identity). Captured at task delegation, used for
-  // crystallization on the subagent's first tool call.
+  // Identity bridge: BY DESIGN upstream, hook tool.execute.* does not expose
+  // the agent field (packages/plugin/src/index.ts) — it is NOT a bug in
+  // OpenCode. Identity is resolved via the sessionID→agent registry built
+  // from the event session.created (empirically reliable: 6/6 child sessions
+  // registered before their first tool call, 0ms race). Captured at task
+  // delegation, used for crystallization on the subagent's first tool call.
   let currentActiveAgent = null;
+  // REV-02 (2026-09-11): rootSessions tracks EVERY root session (orchestrator).
+  // The legacy single slot below was overwritten unconditionally at every
+  // session.created root and by any unregistered session calling task —
+  // with two roots in the same plugin instance (e.g. TUI /new), the FIRST
+  // lost orchestrator status: check 2.5 stopped covering it AND the
+  // anti-crystallization guard stopped protecting it, so it crystallized the
+  // bridge residue (e.g. executor after a successful delegation) gaining
+  // permanent write/bash PASS-THROUGH with the delegated agent's profile.
+  // Every root now joins the Set and keeps its status; the slot is kept
+  // (set only if empty, never stolen) purely for the pre-existing consumers
+  // that compare against it (LRU skip, anti-crystallization guard).
+  const rootSessions = new Set();
   let orchestratorSessionID = null;
   let currentActiveAgentTimestamp = 0;  // timestamp of last set, 0 = never set
+  // VER-LOW-01 (2026-09-11): callID of the task call that LAST CHANGED the
+  // value of currentActiveAgent (null = no owner). The task-handler rollback
+  // must not clobber the bridge of a legitimate sibling: under a same-type
+  // swarm (executor×2) a blocked delegation matches the bare
+  // `currentActiveAgent === targetAgent` check even though the bridge was
+  // armed by a DIFFERENT (still in-flight) call — the ownership guard below
+  // rolls back only the call that actually changed the value.
+  let bridgeArmedByCallID = null;
   const CURRENT_ACTIVE_AGENT_TTL_MS = 300000; // 5 min: freshness window for currentActiveAgent (fix 2026-07-23)
 
   /**
@@ -835,6 +899,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
       pendingAgentTypes.delete(currentActiveAgent);
       currentActiveAgent = null;
       currentActiveAgentTimestamp = 0;
+      bridgeArmedByCallID = null;  // owner reset with the value it armed (VER-LOW-01)
       return null;
     }
     return currentActiveAgent;
@@ -948,19 +1013,23 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
     "tool.execute.before": async (input, output) => {
       const sessionID = input.sessionID || 'default';
 
-      // 0. DEBUG LOGGING (Always active for diagnostics)
-      try {
-        const debugLog = {
-          timestamp: getLocalTimestamp(),
-          tool: input.tool,
-          sessionID: sessionID,
-          input: input, // Logging all input to see if OpenCode changes anything
-          outputArgs: output?.args
-        };
-            const debugPath = path.join(__dirname, 'delegation-guard', 'guard-debug.jsonl');
-        if (!existsSync(path.dirname(debugPath))) mkdirSync(path.dirname(debugPath), { recursive: true });
-        appendFileSync(debugPath, JSON.stringify(debugLog) + '\n', 'utf8');
-      } catch (e) { /* Silently fail */ }
+      // 0. DEBUG LOGGING (opt-in: OPENCODE_GUARD_DEBUG=1)
+      // Full-input logging is verbose and unbounded — gated behind an explicit
+      // env flag. No test or check depends on this log.
+      if (process.env.OPENCODE_GUARD_DEBUG === '1') {
+        try {
+          const debugLog = {
+            timestamp: getLocalTimestamp(),
+            tool: input.tool,
+            sessionID: sessionID,
+            input: input, // Logging all input to see if OpenCode changes anything
+            outputArgs: output?.args
+          };
+          const debugPath = path.join(__dirname, 'delegation-guard', 'guard-debug.jsonl');
+          if (!existsSync(path.dirname(debugPath))) mkdirSync(path.dirname(debugPath), { recursive: true });
+          appendFileSync(debugPath, JSON.stringify(debugLog) + '\n', 'utf8');
+        } catch (e) { /* Silently fail */ }
+      }
 
       // 1. State Recovery (In-Memory Map)
       // FIX (2026-08-15): it was pure FIFO (evict in insertion order), not LRU —
@@ -981,7 +1050,9 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
         if (sessionState.size >= MAX_SESSIONS) {
           let evicted = false;
           for (const key of sessionState.keys()) {
-            if (key === orchestratorSessionID) continue;
+            // REV-02: never evict ANY root session (Set), not only the one
+            // currently holding the legacy single slot.
+            if (key === orchestratorSessionID || rootSessions.has(key)) continue;
             sessionState.delete(key);
             runtimeLog(`MAX_SESSIONS: evicted LRU session ${key}`);
             evicted = true;
@@ -998,45 +1069,53 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
 
       // 2. IDENTITY RESOLUTION (The Survival Hierarchy)
       // Priority:
-      //   1. IdentityInjector (__injectedAgent) - legacy, deprecato
-      //   2. Subagent registry (from event session.created)
-      //   3. Persistence (state.lastAgent) for the current session
-      //   4. currentActiveAgent (bridge workaround for bug #5894)
+      //   1. Subagent registry sessionID→agent (from event session.created) —
+      //      PRIMARY: empirically reliable (6/6 runs), always arrives before
+      //      the child's first tool call
+      //   2. Persistence (state.lastAgent) — identity crystallization for the session
+      //   3. currentActiveAgent (bridge fallback — agent field absent by design
+      //      in tool.execute.*; covers --continue and event loss)
       //
       // NOTE: input.agent and args.subagent_type are NOT guaranteed fields from the API
       // official OpenCode (see packages/plugin/src/index.ts). If present, they are
       // a bonus, but we do not rely on them for identity resolution.
-      const injectedAgent = input.__injectedAgent;
       const registryAgent = subagentRegistry.get(sessionID);
-        const caller = injectedAgent != null
-          ? injectedAgent
-          : (registryAgent || state.lastAgent || getCurrentActiveAgent());
-        const subagentType = caller;
+      const caller = registryAgent || state.lastAgent || getCurrentActiveAgent();
+      const subagentType = caller;
 
-        // Identity crystallization — NEVER on the Orchestrator session.
-        // Previously there was no such guard: if the Orchestrator made a tool call
-        // non-task (e.g. todowrite) after having set currentActiveAgent via a
-        // previous delegation, this block could "crystallize" by mistake the
-        // Orchestrator session with the identity of the last delegated target
-        // — root cause of the Swarm Mode race condition of 2026-07-19 (see also
-        // the removal of state.lastAgent writes in the task dispatcher).
-        if (!state.lastAgent && input.tool !== 'task' && sessionID !== orchestratorSessionID) {
-          const agentToLock = registryAgent || getCurrentActiveAgent();
-          if (agentToLock) {
-            state.lastAgent = agentToLock;
-            sessionState.set(sessionID, state);
-            runtimeLog(`[LOCK] sessionID=${sessionID} agent=${state.lastAgent} source=${registryAgent ? 'registry' : 'currentActive'}`);
-            // The type is now resolved for this session — remove it from pending.
-            // From here on this session uses state.lastAgent, not currentActiveAgent anymore.
-            pendingAgentTypes.delete(agentToLock);
-          }
+      // Identity crystallization — NEVER on the Orchestrator session.
+      // Previously there was no such guard: if the Orchestrator made a tool call
+      // non-task (e.g. todowrite) after having set currentActiveAgent via a
+      // previous delegation, this block could "crystallize" by mistake the
+      // Orchestrator session with the identity of the last delegated target
+      // — root cause of the Swarm Mode race condition of 2026-07-19 (see also
+      // the removal of state.lastAgent writes in the task dispatcher).
+      // REV-02: the guard covers EVERY root session (rootSessions Set), not
+      // only the one currently holding the legacy single slot.
+      if (!state.lastAgent && input.tool !== 'task' && !rootSessions.has(sessionID) && sessionID !== orchestratorSessionID) {
+        const agentToLock = registryAgent || getCurrentActiveAgent();
+        if (agentToLock) {
+          state.lastAgent = agentToLock;
+          sessionState.set(sessionID, state);
+          runtimeLog(`[LOCK] sessionID=${sessionID} agent=${state.lastAgent} source=${registryAgent ? 'registry' : 'currentActive'}`);
+          // The type is now resolved for this session — remove it from pending.
+          // From here on this session uses state.lastAgent, not currentActiveAgent anymore.
+          pendingAgentTypes.delete(agentToLock);
         }
+      }
 
-        // isOrchestrator: true if the current sessionID is that of the Orchestrator.
-        const isOrchestrator = orchestratorSessionID
-          ? (sessionID === orchestratorSessionID)
-          : (input.__isOrchestrator === true || (!caller && !state.lastAgent));
-       // Note: if there is no known agent, the actor is the Orchestrator or an unknown identity
+      // isOrchestrator: true if the current sessionID is a root session.
+      // REV-02: EVERY root is an Orchestrator (rootSessions Set) — with a
+      // single slot, the second root stole the status from the first. The
+      // slot comparison stays as a fallback for roots created before the Set
+      // existed (same-instance upgrades); the heuristic below covers the
+      // very first tool call before any registration.
+      const isOrchestrator = rootSessions.has(sessionID)
+        ? true
+        : (orchestratorSessionID
+            ? (sessionID === orchestratorSessionID)
+            : (!caller && !state.lastAgent));
+      // Note: if there is no known agent, the actor is the Orchestrator or an unknown identity
 
       // 2.4. OBSERVABILITY OF UNKNOWN MCP TOOLS (2026-08-25)
       // FINDING: the dispatcher explicitly handles only the listed native tools
@@ -1099,12 +1178,15 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
       }
 
       // 2.7. CAPTURE TARGET AGENT (Identity Propagation)
-      // OpenCode does not propagate the subagent identity in tool calls (bug #5894).
+      // BY DESIGN upstream, tool.execute.* does not propagate the subagent
+      // identity (no agent field — see packages/plugin/src/index.ts). The
+      // sessionID→agent registry (event session.created) is the primary
+      // identity source; this bridge is the fallback.
       // This bridge must be written ONLY after the conductor-rules gate:
       // a blocked task must not leave pending/identity residue that
       // contaminate the next retry.
       if (input.tool === 'task') {
-        const targetAgent = output?.args?.subagent_type || input.args?.subagent_type;
+        const targetAgent = extractTargetAgent(input, output);
         if (targetAgent) {
           cleanupStalePending();
 
@@ -1116,7 +1198,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
               throw new Error(
                 `❌ PARALLEL CONFLICT: delegated to "${targetAgent}" is blocked — "${otherPendingTypes.join(', ')}" ` +
                 `is still in progress (unresolved) and OpenCode does not guarantee subagent identity in parallel ` +
-                `across different types (bug #5894).\n` +
+                `across different types (upstream design: hook tool.execute.* does not expose agent identity).\n` +
                 `→ Wait for "${otherPendingTypes.join(', ')}" to complete at least one tool call, then retry.\n` +
                 `→ Parallel delegations of the SAME agent (Swarm Mode) remain allowed.`
               )
@@ -1124,26 +1206,39 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
           }
 
           pendingAgentTypes.set(targetAgent, Date.now());
+          // VER-LOW-01: ownership is taken ONLY when this call CHANGES the
+          // bridge value. A same-type swarm delegation (executor×2) re-arms
+          // the same value: the second call must NOT steal ownership of the
+          // bridge legitimately armed by the first in-flight call, or a
+          // routing block on the second would clobber the first's bridge in
+          // the task-handler catch (ownership guard there matches
+          // bridgeArmedByCallID === input.callID).
+          if (currentActiveAgent !== targetAgent) {
+            bridgeArmedByCallID = input.callID;
+          }
           currentActiveAgent = targetAgent;
           currentActiveAgentTimestamp = Date.now();
 
           // Updates Orchestrator reference for non-crystallized sessions
           // and not already confirmed as children by the registry.
+          // REV-02: an unregistered session calling task joins rootSessions
+          // PERMANENTLY (before, it stole the single slot from the previous
+          // holder) — its direct tools stay blocked by check 2.5, fail-closed.
           const callerState = sessionState.get(sessionID);
           const isKnownChildSession = subagentRegistry.has(sessionID);
           if ((!callerState || !callerState.lastAgent) && !isKnownChildSession) {
-            orchestratorSessionID = sessionID;
+            rootSessions.add(sessionID);
+            if (!orchestratorSessionID) orchestratorSessionID = sessionID;
           }
         }
       }
 
       // 3. ABSOLUTE PRIORITY: SENSITIVE FILE CHECK (Always active)
       if (['read', 'grep', 'glob'].includes(input.tool)) {
-        const profileForC = subagentType ? agentProfiles[subagentType] : null;
         const filePath = output?.args?.filePath || output?.args?.pattern || input.args?.filePath || input.args?.pattern || input.args?.path || '';
         if (filePath) {
           auditedCheck(sessionID, subagentType || 'unknown', 'sensitive_file',
-            () => checkSensitiveFileAccess(subagentType || 'unknown', profileForC, filePath, input.tool),
+            () => checkSensitiveFileAccess(subagentType || 'unknown', filePath, input.tool),
             { filePath, tool: input.tool });
         }
       }
@@ -1152,14 +1247,18 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
       if (!subagentType) {
         const safeReadTools = ['read', 'grep', 'glob', 'ls', 'cat', 'find'];
         if (safeReadTools.includes(input.tool)) {
-          runtimeLog(`⚠️ GRAY ZONE: tool "${input.tool}" allowed (unknown identity). SessionID: ${sessionID}`);
+          runtimeLog(`⚠️ GRAY ZONE: read-only tool "${input.tool}" allowed (unknown identity, safe). SessionID: ${sessionID}`);
           return; // Allowed in safe mode
         }
 
-        // Mutable tools: we allow execution but log the warning 
-        const mutativeTools = ['bash', 'edit', 'write', 'rm'] 
-        if (mutativeTools.includes(input.tool)) { 
-          runtimeLog(`⚠️ GRAY ZONE: mutative tool "${input.tool}" allowed with unknown identity. SessionID: ${sessionID}`); 
+        // M1/REV-05 (2026-09-10): mutative tools (bash/edit/write/rm) at
+        // unknown identity are NOT allowed through — each is blocked fail-closed
+        // downstream in the dispatcher (bash_block / edit_block / write_block /
+        // tool_phase). This log is observability only: it records the attempt
+        // before the respective dispatcher branch throws.
+        const mutativeTools = ['bash', 'edit', 'write', 'rm']
+        if (mutativeTools.includes(input.tool)) {
+          runtimeLog(`⚠️ GRAY ZONE: mutative tool "${input.tool}" attempted with unknown identity — will be blocked downstream. SessionID: ${sessionID}`);
         }
       }
 
@@ -1251,6 +1350,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
         const beforeAuditLen = state.webfetchAudit.length
 
         // Maintain Schema Check: must start with http:// or https://
+        // Single schema check point — checkWebfetch no longer duplicates it (M3 dedup, REV-02)
         if (!/^https?:\/\//i.test(url)) {
           auditedCheck(sessionID, subagentType || 'unknown', 'webfetch_schema', () => {
             throw new Error(`❌ WEBFETCH: URL scheme not allowed for "${subagentType || 'unknown'}": ${url}. Only http/https allowed.`);
@@ -1260,10 +1360,16 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
         if (isOrchestrator) {
           // Allow Orchestrator immediately
           state.webfetchAudit.push({ agent: 'orchestrator', url, prompt: prompt?.substring(0, 100), timestamp: Date.now(), allowed: true, reason: 'orchestrator' });
-        } else if (!profile) {
-          // Expand Grey Zone: identity unknown (subagentType provided but no profile found)
-          runtimeLog(`⚠️ GRAY ZONE: tool "webfetch" allowed with unknown identity. SessionID: ${sessionID}`);
-          state.webfetchAudit.push({ agent: subagentType || 'unknown', url, prompt: prompt?.substring(0, 100), timestamp: Date.now(), allowed: true, reason: 'grey_zone' });
+        } else if (!subagentType || subagentType === 'orchestrator') {
+          // REV-05 (2026-09-10): unknown identity was previously a 'grey_zone'
+          // ALLOW entry with no check at all — webfetch is now fail-closed,
+          // specular to the M1 write fix. Profiled agents keep their own
+          // branch below; a subagentType with no profile (unregistered agent)
+          // also lands in checkWebfetch, which throws fail-closed on the
+          // null-profile guard.
+          auditedCheck(sessionID, 'unknown', 'webfetch_block', () => {
+            throw new Error(`❌ WEBFETCH: unknown identity — webfetch forbidden until the session is registered as a subagent. Delegate instead.`)
+          }, { url, prompt });
         } else {
           // Preserve Profile Logic for known subagents
           auditedCheck(sessionID, subagentType, 'webfetch', () => {
@@ -1313,6 +1419,26 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
         const filePath = output?.args?.filePath || input.args?.filePath || ''
         const exists = input.args?.exists === true || output?.args?.exists === true
         const writeAgent = subagentType || 'unknown'
+        // M1 (2026-09-10, REV-01): the only real mutative hole at unknown
+        // identity — write fell through to checkWritePath("unknown", ...) and
+        // passed. bash/edit/rm were already blocked downstream; now write is
+        // fail-closed too, specular to the edit pattern below. For a true
+        // Orchestrator session check 2.5 (orchestrator_direct_tool) already
+        // blocks write BEFORE this line, so the throw below is effectively for
+        // the unknown-identity case — kept as-is (harmless redundancy).
+        // VER-M1-01: audit label unified to 'unknown' (was 'orchestrator') —
+        // matches the webfetch_block label for unknown identity; the audit
+        // agent argument is observability only, the thrown message is unchanged.
+        // REV-01 (2026-09-11): this fail-closed throw only holds if a BLOCKED
+        // delegation leaves no identity residue — the task-handler catch below
+        // must roll back currentActiveAgent (not just pendingAgentTypes), or an
+        // unregistered session resolves the rejected target and skips this throw.
+        if (isOrchestrator || !subagentType || subagentType === 'orchestrator') {
+          auditedCheck(sessionID, 'unknown', 'write_block', () => {
+            throw new Error(`❌ WRITE: unknown identity — the session is not registered as a subagent. Delegate instead.`)
+          }, { filePath })
+          return
+        }
         auditedCheck(sessionID, writeAgent, 'write_path', () => {
           checkWritePath(writeAgent, filePath, exists, state.scopeViolationTargets)
         }, { filePath, exists })
@@ -1333,7 +1459,13 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
 
       // ---- TASK DELEGATION (case B) ----
       if (input.tool === 'task') {
-        const targetAgent = output?.args?.subagent_type
+        // VER-LOW-02: SAME extractor as the arming block above (shared
+        // helper) — a delegation with subagent_type only in input.args now
+        // enters the full validation flow instead of early-returning with
+        // the bridge armed and no rollback path. The early return below
+        // fires only when BOTH sources lack subagent_type, in which case the
+        // arming block never armed anything (its own `if (targetAgent)`).
+        const targetAgent = extractTargetAgent(input, output)
         runtimeLog(`TASK HANDLER START: tool=${input.tool}, targetAgent=${targetAgent}`)
         try {
           const prompt = output?.args?.prompt ?? ""
@@ -1356,7 +1488,10 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
             // OpenCode schema (so the delegation IS executed) but does not
             // correspond to any configured agent — must be blocked, not
             // left to pass silently.
-            pendingAgentTypes.delete(targetAgent);
+            // NOTE (REV-04): no pendingAgentTypes.delete here — this throw is
+            // caught by the task-handler catch below, which performs the full
+            // symmetric rollback (pending + identity bridge). A delete here
+            // would be redundant.
             auditedCheck(sessionID, targetAgent, 'unknown_agent', () => {
               throw new Error(
                 `❌ ROUTING: subagent_type "${targetAgent}" does not exist in guard-config.json — delegation forbidden.\n` +
@@ -1502,11 +1637,42 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
             fullTextPreview: fullText.substring(0, 200)
           })
         } catch (taskError) {
-          // Rollback: remove targetAgent from pending because the subagent
-          // will never be created (check failed before creation).
+          // Rollback: the subagent will never be created (the check failed before
+          // creation), so neither pendingAgentTypes NOR the identity bridge may keep
+          // the rejected target. Leaving currentActiveAgent armed grants the rejected
+          // agent's profile to the NEXT unregistered session (write/bash/edit pass:
+          // validatePathZone does not consult agentProfiles) and crystallizes it
+          // permanently into state.lastAgent (identity lock block) — fail-closed
+          // inverted to fail-open by the block itself.
+          //
+          // VER-LOW-01 (2026-09-11): the bridge rollback is guarded by
+          // OWNERSHIP, not just by value. Under a same-type swarm (executor×2,
+          // legitimate fan-out — the parallel_identity_conflict gate filters
+          // t !== targetAgent and lets same-type through) a blocked delegation
+          // has `currentActiveAgent === targetAgent` true even when the bridge
+          // was armed by a DIFFERENT in-flight sibling call: rolling back on
+          // the value alone would clobber the legitimate sibling's bridge
+          // (degrading it to unknown identity). The double guard
+          // `currentActiveAgent === targetAgent && bridgeArmedByCallID === input.callID`
+          // rolls back ONLY the call that took ownership (the call that last
+          // CHANGED the bridge value — see the arming block). A blocked
+          // delegation that never changed the value leaves the sibling's
+          // bridge intact; a blocked delegation that DID arm (single
+          // delegation, or first-of-swarm) rolls back fully (pins 29.3/29.4).
+          //
+          // pendingAgentTypes.delete stays UNCONDITIONAL (documented minor
+          // side-effect): it only disarms the defensive
+          // parallel_identity_conflict gate for the sibling type — never
+          // observed necessary (registry is the primary identity source,
+          // P2.7-8/P2.9) and re-armed by the next delegation of that type.
           if (targetAgent) {
             pendingAgentTypes.delete(targetAgent);
-            runtimeLog(`[ROLLBACK] removed ${targetAgent} from pendingAgentTypes after task check failure: ${taskError.message}`);
+            if (currentActiveAgent === targetAgent && bridgeArmedByCallID === input.callID) {
+              currentActiveAgent = null;
+              currentActiveAgentTimestamp = 0;
+              bridgeArmedByCallID = null;
+            }
+            runtimeLog(`[ROLLBACK] cleared pending+bridge for "${targetAgent}" after task check failure: ${taskError.message}`);
           }
           throw taskError;  // Re-throw to maintain the blocking behavior
         }
@@ -1607,7 +1773,11 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
           // Root session (no parentID) → probably the Orchestrator
           else if (info.agent) {
             runtimeLog(`[REGISTRY] session.created root=${sessionID} agent=${info.agent} (orchestrator)`)
-            orchestratorSessionID = sessionID
+            // REV-02: every root joins the Set; the single slot is set only
+            // if empty — a second root must NOT steal orchestrator status
+            // from the first.
+            rootSessions.add(sessionID);
+            if (!orchestratorSessionID) orchestratorSessionID = sessionID;
           }
           // Session without agent → gray zone
           else {
@@ -1630,6 +1800,12 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
         const sessionID = event?.sessionID
         if (sessionID) {
           subagentRegistry.delete(sessionID);
+          // REV-02: prune the root session from the Set (TUI /new, session
+          // close). NOTE: session.deleted is never emitted in headless run
+          // mode (see SESSIONS.md P2.10) — in-memory Set is process-bound
+          // anyway, so un-pruned entries die with the plugin instance.
+          rootSessions.delete(sessionID);
+          if (orchestratorSessionID === sessionID) orchestratorSessionID = null;
           const state = sessionState.get(sessionID)
           if (state) {
             state.delegationSequence = []
@@ -1727,9 +1903,15 @@ function handleDeniedEvent(agent, details) {
     }
     const metricsPath = path.resolve(_projectDirectory, '.opencode', 'metrics_count.json');
     const incidentsPath = path.resolve(_projectDirectory, '.planning', 'INCIDENTS.md');
+    // FIX (2026-09-11, LESSONS containment): lessons used to be written to
+    // ~/.config/opencode/LESSONS.md — OUTSIDE the project containment, so
+    // denied phrases from one project leaked into a cross-project file.
+    // Now co-located with INCIDENTS.md in the project's .planning/ dir
+    // (same _projectDirectory mechanism, same append semantics). The old
+    // homedir file, if present, is user data and is NOT touched/migrated.
+    const lessonsPath = path.resolve(_projectDirectory, '.planning', 'LESSONS.md');
     const metricsDir = path.dirname(metricsPath);
     const planningDir = path.dirname(incidentsPath);
-    const lessonsPath = path.join(os.homedir(), '.config', 'opencode', 'LESSONS.md');
     const lessonsDir = path.dirname(lessonsPath);
 
     if (!existsSync(metricsDir)) mkdirSync(metricsDir, { recursive: true });
@@ -1828,14 +2010,14 @@ function persistAuditEvent(sessionId, eventType, agent, action, details = {}) {
 
 /**
  * Creates an initial session state.
- * @returns {{ phase: 'idle'|'pre-delegation'|'delegated', lastAgent: string|null, explorerContext: string, delegationHistory: any[], webfetchAudit: any[], secretDetectionAudit: any[], delegationSequence: string[] }}
+ * M4 (2026-09-10): the two legacy context/history fields removed — dead state
+ * (never read nor written anywhere else), pinned by M4 analysis.
+ * @returns {{ phase: 'idle'|'pre-delegation'|'delegated', lastAgent: string|null, webfetchAudit: any[], secretDetectionAudit: any[], delegationSequence: string[] }}
  */
 function createSessionState() {
   return {
     phase: /** @type {'idle'} */ ('idle'),
     lastAgent: null,
-    explorerContext: '',
-    delegationHistory: /** @type {any[]} */ ([]),
     webfetchAudit: /** @type {any[]} */ ([]),
     secretDetectionAudit: /** @type {any[]} */ ([]),
     delegationStack: /** @type {string[]} */ ([]),
@@ -1873,331 +2055,63 @@ function normalizePathForCheck(filePath) {
   return path.posix.normalize(noTraversal).replace(/^\/+/, '')
 }
 
+/**
+ * M2 (2026-09-10): the fallback is a MINIMAL SAFETY-NET, no longer a full
+ * embedded copy of the policy. The old 325-line copy had real drift vs
+ * guard-config.json (e.g. bashAllowlist for codebase-mapper). The single
+ * source of truth for the full policy is now guard-config.json, which also
+ * carries neverDo/keywords/allowMentions (migrated verbatim from the old
+ * fallback in the same change).
+ *
+ * This fallback activates ONLY when guard-config.json is missing/unreadable
+ * and must be:
+ *   - FAIL-CLOSED on every mutative capability: bashAllowlist [] (total bash
+ *     deny for ALL agents), canWebfetch false, canDelegateTo [] (sub-delegation
+ *     backstop denies all — native task:deny already blocks children anyway)
+ *   - FAIL-OPERATIONAL for delegation routing: delegation_rules with
+ *     can_handle_directly ['*'] (wildcard, supported in checkDelegationRules)
+ *     so a missing config does not brick every delegation, while all
+ *     config-independent checks (sensitive files, dangerous actions, path
+ *     zones, workflow, secrets) stay fully active
+ *   - REV-03: neverDo [] — empty array passes checkNeverDo with no matching;
+ *     the neverDo POLICY lives exclusively in guard-config.json
+ *   - SEMANTICS-PRESERVING on the per-agent security fields: allowEdit,
+ *     readOnlyDespiteFullBash, writeScope, noTestExecution and canPreDelegate
+ *     keep the values they had in the previous fallback, so read-only roles
+ *     stay read-only and executor keeps its edit/no-test semantics even
+ *     without config.
+ */
+const SAFETY_NET_FALLBACK_ROLE = 'safety-net fallback (guard-config.json missing)'
+/** @type {(overrides?: Record<string, any>) => any} */
+const makeSafetyNetProfile = (overrides = {}) => ({
+  role: SAFETY_NET_FALLBACK_ROLE,
+  bashAllowlist: [],      // fail-closed: no bash at all without config
+  canWebfetch: false,
+  canDelegateTo: [],      // fail-closed: sub-delegation backstop denies all
+  neverDo: [],            // REV-03: policy lives in guard-config.json only
+  keywords: [],
+  allowMentions: [],
+  canPreDelegate: false,
+  writeScope: 'all',
+  delegation_rules: { can_handle_directly: ['*'] }, // REV-03: routing stays operational
+  ...overrides,
+})
+
 /** @type {() => any} */
 const createAgentProfilesFallback = () => ({
-  "codebase-mapper": {
-    role: "codebase mapping",
-    allowEdit: false,
-    keywords: ["map", "architecture", "structure", "dependencies", "stack"],
-    allowMentions: ["fix", "test"],
-    neverDo: ["apply correction", "implement feature", "modify code", "run test"],
-    canPreDelegate: true,
-    // Consistency with guard-config.json (2026-07-25): was missing here, present only
-    // in the external config — the internal fallback would lack this protection
-    // if guard-config.json were never loaded.
-    readOnlyDespiteFullBash: true,
-    bashAllowlist: ["grep *", "rg *", "python -m graphify query*", "python -m graphify path*", "python -m graphify explain*"],
-    canWebfetch: false,
-    canDelegateTo: ["explorer"],
-    writeScope: "all",
-    delegation_rules: {
-      can_handle_directly: ["exploration", "code_search", "architecture_analysis", "dependency_mapping"],
-      must_delegate_to: {
-        verification: "verifier",
-        testing: "tester",
-        documentation: "doc-writer",
-        debugging: "debugger",
-        exploration: "explorer",
-        security_audit: "security-auditor",
-        code_review: "code-reviewer",
-        ui_prototyping: "sketcher",
-        feasibility_spike: "spiker"
-      }
-    }
-  },
-  "code-reviewer": {
-    role: "code analysis",
-    allowEdit: false,
-    keywords: ["review", "code analysis", "quality", "security review"],
-    allowMentions: ["fix", "implement"],
-    neverDo: ["apply correction", "implement feature", "modify code"],
-    canPreDelegate: false,
-    readOnlyDespiteFullBash: true,
-    bashAllowlist: ["grep *", "rg *", "npm test*", "npm run test*", "npm run lint*", "npm run typecheck*", "npx tsc*", "python -m graphify query*", "python -m graphify path*", "python -m graphify explain*"],
-    canWebfetch: false,
-    canDelegateTo: ["executor"],
-    writeScope: "all",
-    delegation_rules: {
-      can_handle_directly: ["code_review", "quality_analysis"],
-      must_delegate_to: {
-        verification: "verifier",
-        testing: "tester",
-        documentation: "doc-writer",
-        debugging: "debugger",
-        exploration: "explorer",
-        security_audit: "security-auditor",
-        code_review: "code-reviewer",
-        ui_prototyping: "sketcher",
-        feasibility_spike: "spiker"
-      }
-    }
-  },
-  "debugger": {
-    role: "diagnosis",
-    allowEdit: false,
-    keywords: ["debug", "analyze", "root cause", "why it crashes", "errors", "stack trace", "diagnostics", "identify", "find"],
-    allowMentions: ["fix", "test", "error"],
-    neverDo: ["apply fix", "implement fix", "modify code", "write test", "run test"],
-    canPreDelegate: false,
-    // The debugger has full bash (bashAllowlist:["*"] via guard-config.json) for
-    // running tsc/test/graphify freely, but by role must NEVER mutate
-    // files — same risk class already closed for the verifier (07-15).
-    readOnlyDespiteFullBash: true,
-    bashAllowlist: ["grep *", "rg *", "npx tsc*", "npm run typecheck*", "python -m graphify query*", "python -m graphify path*", "python -m graphify explain*", "graphify query*", "graphify path*", "graphify explain*", "npx graphify*", "node graphify*"],
-    canWebfetch: true, // aligned with guard-config.json — debugger can search error/stack traces online
-    canDelegateTo: ["executor", "tester", "verifier"],
-    writeScope: "all",
-    delegation_rules: {
-      can_handle_directly: ["debugging", "root_cause", "error_analysis", "stack_trace"],
-      must_delegate_to: {
-        verification: "verifier",
-        testing: "tester",
-        documentation: "doc-writer",
-        debugging: "debugger",
-        exploration: "explorer",
-        security_audit: "security-auditor",
-        code_review: "code-reviewer",
-        ui_prototyping: "sketcher",
-        feasibility_spike: "spiker"
-      }
-    }
-  },
-  "doc-writer": {
-    role: "documentation",
-    allowEdit: true,
-    keywords: ["documentation", "readme", "manual", "guides", "api docs", "docs", "update docs",
-               "write documentation", "status_report", "changelog", "sessions", "planning files", "state.md",
-               "restore file", "restore file", "update report", "update report", "write report", "generate report"],
-    allowMentions: ["fix", "test", "code", "verify", "validate", "check", "review", "diagnosis", "bug", "error"],
-    neverDo: ["apply fix", "perform diagnosis", "execute code modification"],
-    canPreDelegate: false,
-    bashAllowlist: [],
-    canWebfetch: false,
-    canDelegateTo: ["executor", "verifier", "doc-writer", "explorer"],
-    writeScope: "readme",
-    delegation_rules: {
-      can_handle_directly: ["documentation", "readme", "changelog", "api_docs"],
-      must_delegate_to: {
-        verification: "verifier",
-        testing: "tester",
-        documentation: "doc-writer",
-        debugging: "debugger",
-        exploration: "explorer",
-        security_audit: "security-auditor",
-        code_review: "code-reviewer",
-        ui_prototyping: "sketcher",
-        feasibility_spike: "spiker"
-      }
-    }
-  },
-  "executor": {
-    role: "implementation",
-    allowEdit: true,
-    keywords: ["fix", "implement", "modify", "add", "refactor", "apply", "commit",
-               "copy", "backup", "move", "rename", "create folder", "replicate",
-               "copy", "move", "rename", "mkdir", "create", "deploy", "install", "configure"],
-    allowMentions: ["diagnosis", "analysis", "documentation", "test", "readme", "status", "report"],
-    neverDo: ["perform diagnosis", "write test", "run test", "write documentation", "perform analysis",
-              "update readme", "update docs", "write manual",
-              "write readme", "write status_report", "update status_report",
-              "write changelog", "update changelog", "write sessions", "update sessions", "update sessions",
-              "planning files", "planning files", "update state.md", "update state.md",
-              "restore file", "restore file", "write report", "update report"],
-    canPreDelegate: false,
-    // The executor implements, doesn't certify its own work: execution
-    // (npm test/pytest/jest/etc. via bash) belongs to the verifier.
-    noTestExecution: true,
-    bashAllowlist: ["*"], // allow full — executor with atomic commit/push
-    canWebfetch: true, // explicit user request 2026-07-24 — needed to download external resources (e.g. Python releases) during implementation
-    canDelegateTo: ["*"],
-    writeScope: "all",
-    delegation_rules: {
-      can_handle_directly: ["implementation", "refactor", "bugfix", "deployment", "configuration"],
-      must_delegate_to: {
-        verification: "verifier",
-        testing: "tester",
-        documentation: "doc-writer",
-        debugging: "debugger",
-        exploration: "explorer",
-        security_audit: "security-auditor",
-        code_review: "code-reviewer",
-        ui_prototyping: "sketcher",
-        feasibility_spike: "spiker"
-      }
-    }
-  },
-  "explorer": {
-    role: "research",
-    allowEdit: false,
-    keywords: ["explore", "analysis", "contextualize", "where is", "how it works", "search", "find", "structure"],
-    allowMentions: ["fix", "test", "implement"],
-    neverDo: ["apply correction", "implement feature", "modify code", "create file", "write code"],
-    canPreDelegate: true,
-    readOnlyDespiteFullBash: true,
-    bashAllowlist: [
-      "Get-ChildItem*",
-      "Get-Content*",
-      "Get-Item*",
-      "Select-String*",
-      "python -m graphify query*",
-      "python -m graphify path*",
-      "python -m graphify explain*"
-    ],
-    canWebfetch: true, // aligned with guard-config.json
-    canDelegateTo: ["executor", "verifier", "doc-writer", "explorer"], // OpenCode does not expose the task tool to pre-delegation agents
-    writeScope: "planning",
-    delegation_rules: {
-      can_handle_directly: ["exploration", "code_search", "architecture_analysis", "dependency_mapping"],
-      must_delegate_to: {
-        verification: "verifier",
-        testing: "tester",
-        documentation: "doc-writer",
-        debugging: "debugger",
-        exploration: "explorer",
-        security_audit: "security-auditor",
-        code_review: "code-reviewer",
-        ui_prototyping: "sketcher",
-        feasibility_spike: "spiker"
-      }
-    }
-  },
-  "security-auditor": {
-    role: "audit security",
-    allowEdit: false,
-    keywords: ["security", "vulnerability", "audit", "owasp"],
-    allowMentions: ["fix", "implement"],
-    neverDo: ["apply correction", "implement feature", "modify code"],
-    canPreDelegate: false,
-    readOnlyDespiteFullBash: true,
-    bashAllowlist: ["grep *", "rg *", "npm audit*", "npm run audit*"],
-    canWebfetch: false,
-    canDelegateTo: ["executor"],
-    writeScope: "all",
-    delegation_rules: {
-      can_handle_directly: ["security_audit", "vulnerability_scan"],
-      must_delegate_to: {
-        verification: "verifier",
-        testing: "tester",
-        documentation: "doc-writer",
-        debugging: "debugger",
-        exploration: "explorer",
-        security_audit: "security-auditor",
-        code_review: "code-reviewer",
-        ui_prototyping: "sketcher",
-        feasibility_spike: "spiker"
-      }
-    }
-  },
-  "sketcher": {
-    role: "UI prototypes",
-    allowEdit: true,
-    keywords: ["mockup", "wireframe", "ui", "ux", "design", "visual prototype"],
-    allowMentions: ["fix"],
-    neverDo: ["apply correction", "implement backend", "implement logic"],
-    canPreDelegate: false,
-    bashAllowlist: [], // deny totale
-    canWebfetch: false,
-    canDelegateTo: ["executor", "verifier", "doc-writer", "explorer"],
-    writeScope: "sketches",
-    delegation_rules: {
-      can_handle_directly: ["ui_prototyping", "mockup", "wireframe"],
-      must_delegate_to: {
-        verification: "verifier",
-        testing: "tester",
-        documentation: "doc-writer",
-        debugging: "debugger",
-        exploration: "explorer",
-        security_audit: "security-auditor",
-        code_review: "code-reviewer",
-        ui_prototyping: "sketcher",
-        feasibility_spike: "spiker"
-      }
-    }
-  },
-  "spiker": {
-    role: "throwaway prototypes",
-    allowEdit: true,
-    keywords: ["prototype", "spike", "feasibility", "feasibility test"],
-    allowMentions: [],
-    neverDo: ["fix real project", "modify main codebase"],
-    canPreDelegate: false,
-    bashAllowlist: ["*"], // allow full — throwaway prototypes
-    canWebfetch: false,
-    canDelegateTo: ["*"],
-    writeScope: "spikes",
-    delegation_rules: {
-      can_handle_directly: ["feasibility_spike", "throwaway_prototype"],
-      must_delegate_to: {
-        verification: "verifier",
-        testing: "tester",
-        documentation: "doc-writer",
-        debugging: "debugger",
-        exploration: "explorer",
-        security_audit: "security-auditor",
-        code_review: "code-reviewer",
-        ui_prototyping: "sketcher",
-        feasibility_spike: "spiker"
-      }
-    }
-  },
-  "tester": {
-    role: "test writing",
-    allowEdit: true,
-    keywords: ["write test", "create test", "e2e", "maestro", "playwright", "coverage", "scenario"],
-    allowMentions: ["test", "run", "verify"],
-    neverDo: ["run test", "apply correction", "perform diagnostic", "modify source code"],
-    canPreDelegate: false,
-    bashAllowlist: [], // deny totale
-    canWebfetch: false,
-    canDelegateTo: ["executor"],
-    writeScope: "all",
-    delegation_rules: {
-      can_handle_directly: ["testing", "e2e", "unit_test", "test_creation"],
-      must_delegate_to: {
-        verification: "verifier",
-        testing: "tester",
-        documentation: "doc-writer",
-        debugging: "debugger",
-        exploration: "explorer",
-        security_audit: "security-auditor",
-        code_review: "code-reviewer",
-        ui_prototyping: "sketcher",
-        feasibility_spike: "spiker"
-      }
-    }
-  },
-  "verifier": {
-    role: "validation",
-    allowEdit: false,
-    keywords: ["verify", "validate", "run test", "check", "review", "lint", "screenshot", "validate"],
-    allowMentions: ["test", "fix", "run"],
-    neverDo: ["apply correction", "write test", "perform diagnostic", "modify code"],
-    canPreDelegate: false,
-    bashAllowlist: ["*"], // allow full — documented anomaly (only read-only role with bash)
-    // The verifier has full bash only to run tests/lint, NEVER to mutate files.
-    // checkShellMutation blocks bash commands that write/modify/delete
-    // files (PowerShell Set-Content, Python open('w'), sed -i, redirection, etc.)
-    // thereby bypassing the "fix" ban that would otherwise apply only
-    // to edit/write tools (which the verifier doesn't have anyway) and to the prompt text.
-    readOnlyDespiteFullBash: true,
-    canWebfetch: false,
-    canDelegateTo: ["executor", "doc-writer"],
-    writeScope: "all",
-    delegation_rules: {
-      can_handle_directly: ["verification", "validation", "review", "linting"],
-      must_delegate_to: {
-        verification: "verifier",
-        testing: "tester",
-        documentation: "doc-writer",
-        debugging: "debugger",
-        exploration: "explorer",
-        security_audit: "security-auditor",
-        code_review: "code-reviewer",
-        ui_prototyping: "sketcher",
-        feasibility_spike: "spiker"
-      }
-    }
-  }
+  // allowEdit / readOnlyDespiteFullBash / writeScope / canPreDelegate /
+  // noTestExecution below = values preserved from the pre-M2 fallback.
+  'codebase-mapper': makeSafetyNetProfile({ allowEdit: false, readOnlyDespiteFullBash: true, canPreDelegate: true, writeScope: 'all' }),
+  'code-reviewer': makeSafetyNetProfile({ allowEdit: false, readOnlyDespiteFullBash: true, writeScope: 'all' }),
+  'debugger': makeSafetyNetProfile({ allowEdit: false, readOnlyDespiteFullBash: true, writeScope: 'all' }),
+  'doc-writer': makeSafetyNetProfile({ allowEdit: true, writeScope: 'readme' }),
+  'executor': makeSafetyNetProfile({ allowEdit: true, writeScope: 'all', noTestExecution: true }),
+  'explorer': makeSafetyNetProfile({ allowEdit: false, readOnlyDespiteFullBash: true, canPreDelegate: true, writeScope: 'planning' }),
+  'security-auditor': makeSafetyNetProfile({ allowEdit: false, readOnlyDespiteFullBash: true, writeScope: 'all' }),
+  'sketcher': makeSafetyNetProfile({ allowEdit: true, writeScope: 'sketches' }),
+  'spiker': makeSafetyNetProfile({ allowEdit: true, writeScope: 'spikes' }),
+  'tester': makeSafetyNetProfile({ allowEdit: true, writeScope: 'all' }),
+  'verifier': makeSafetyNetProfile({ allowEdit: false, readOnlyDespiteFullBash: true, writeScope: 'all' }),
 })
 
 // ============================================
@@ -2391,23 +2305,13 @@ function checkWebfetch(agent, profile, url, prompt, auditLog) {
   if (!profile) {
     throw new Error(`❌ GUARD: profile not found for agent "${agent}". Delegation/routing invalid.`)
   }
-  // Calculates the check outcome BEFORE the audit/push (Finding #10: schema check + Finding #7: success/fail)
-  // Schema check (Finding #10): blocks file://, javascript:, data: also for agent with canWebfetch
-  if (!/^https?:\/\//i.test(url)) {
-    if (Array.isArray(auditLog)) {
-      auditLog.push({
-        agent,
-        url,
-        prompt: prompt?.substring(0, 100),
-        timestamp: Date.now(),
-        allowed: false,
-        reason: 'invalid_url_schema'
-      })
-    }
-    throw new Error(
-      `❌ WEBFETCH: URL scheme not allowed for "${agent}": ${url}. Only http/https allowed.`
-    )
-  }
+  // M3 dedup (REV-02, 2026-09-10): the URL schema check (http/https only)
+  // used to live here AND in the dispatcher. The dispatcher check runs FIRST
+  // for every identity branch (orchestrator/unknown/profile) — the only
+  // call site of this function — so the duplicate here was unreachable
+  // dead logic. Removed along with its 'invalid_url_schema' audit entry,
+  // which was write-only (pushed right before a throw; the dispatcher only
+  // persists audit entries when no error was raised).
   const hasExplicitRequest = !!(prompt && /explicit user webfetch request/i.test(prompt))
   const willAllow = profile.canWebfetch === true || hasExplicitRequest
   if (Array.isArray(auditLog)) {
@@ -2462,8 +2366,14 @@ function checkTaskSubDelegation(caller, callerProfile, target, allProfiles) {
  * Check A — Scans tool output for secrets/credentials patterns.
  * If a SECRET is FOUND → throw with a redacted message + audit log.
  *
- * Trusted agents (canDelegateTo include "*", e.g. executor) are skipped
- * because they legitimately manage secrets (commit, env setup, etc.).
+ * Trusted agents (explicit `trustedForSecrets: true` in guard-config.json,
+ * e.g. executor, spiker) are skipped because they legitimately manage
+ * secrets (commit, env setup, etc.). REV-09 (2026-09-10): trust is NEVER
+ * derived from other capabilities (previously canDelegateTo:["*"] implied
+ * the skip — a permissive custom agent would have inherited the exemption
+ * without being really trusted); it is an explicit per-agent config flag,
+ * and the M2 safety-net fallback does NOT set it (no trusted agent without
+ * config).
  *
  * PURE function, reusable in any context (even tool.execute.before
  * for preliminary check). In the `tool.execute.after` hook it is called in
@@ -2481,8 +2391,12 @@ function checkSecretsInOutput(output, subagent, profile, auditLog, filePath) {
   if (!profile) {
     throw new Error(`❌ GUARD: profile missing for checkSecretsInOutput (subagent: ${subagent})`)
   }
-  // Trusted agents (e.g. executor with canDelegateTo:["*"]) → skip
-  if (Array.isArray(profile.canDelegateTo) && profile.canDelegateTo.includes('*')) return
+  // Trusted agents → skip. REV-09 (2026-09-10): trust is EXPLICIT per-agent
+  // config (`trustedForSecrets: true` in guard-config.json), never derived
+  // from other capabilities. The old derivation from canDelegateTo:["*"]
+  // granted the exemption to any permissive custom agent without a real
+  // trust decision. The M2 fallback never sets the flag → fail-closed.
+  if (profile.trustedForSecrets === true) return
   // Guard log/lesson files → skip (path mentions, not real secrets)
   if (isSecretScanExcluded(filePath)) return
 
@@ -2520,13 +2434,17 @@ function checkSecretsInOutput(output, subagent, profile, auditLog, filePath) {
  *
  * PURE function, normalizes Windows backslash to forward slash for consistent matching.
  *
+ * REV-05 (2026-09-11): the `profile` parameter has been removed — the body
+ * never read it, and its presence invited per-profile exceptions back
+ * (removed three times, see the comment below). Sensitive-file enforcement
+ * is agent-blind by design: NO profile can opt out.
+ *
  * @param {string} agent - Agent name (e.g. 'debugger')
- * @param {any} profile - Agent profile (optional)
  * @param {string|null|undefined} filePath - Path of the file or pattern to check
  * @param {string} toolName - Tool attempting access ('read', 'grep', 'glob')
  * @throws {Error} if the file matches a SENSITIVE_FILE_PATTERNS
  */
-function checkSensitiveFileAccess(agent, profile, filePath, toolName) {
+function checkSensitiveFileAccess(agent, filePath, toolName) {
   if (!filePath || typeof filePath !== 'string') return
 
   // NO exception for bashAllowlist:["*"]. This exception had already been
@@ -2655,7 +2573,7 @@ function checkEditPath(agent, filePath) {
   // could overwrite .env/SSH keys/credentials without any block, as long as
   // the path was inside the project (validatePathZone doesn't care, it checks
   // only project boundaries, not the sensitive content of the path).
-  checkSensitiveFileAccess(agent, null, filePath, 'edit')
+  checkSensitiveFileAccess(agent, filePath, 'edit')
   validatePathZone(agent, filePath, 'edit')
 }
 
@@ -2713,7 +2631,7 @@ function throwOrEscalateScopeViolation(agent, filePath, scopeViolationTargets, b
 function checkWritePath(agent, filePath, exists, scopeViolationTargets) {
   // FIX (2026-07-25): same hole as checkEditPath — missing pattern scan
   // for sensitive files on write.
-  checkSensitiveFileAccess(agent, null, filePath, 'write')
+  checkSensitiveFileAccess(agent, filePath, 'write')
 
   const restriction = RESTRICTED_WRITE_SCOPE_AGENTS[agent]
 

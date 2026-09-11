@@ -35,7 +35,24 @@
           "feasibility_spike": "spiker"
         }
       },
-      "readOnlyDespiteFullBash": true
+      "readOnlyDespiteFullBash": true,
+      "keywords": [
+        "map",
+        "architecture",
+        "structure",
+        "dependencies",
+        "stack"
+      ],
+      "allowMentions": [
+        "fix",
+        "test"
+      ],
+      "neverDo": [
+        "apply correction",
+        "implement feature",
+        "modify code",
+        "run test"
+      ]
     },
     "code-reviewer": {
       "role": "code analysis",
@@ -70,7 +87,22 @@
           "feasibility_spike": "spiker"
         }
       },
-      "readOnlyDespiteFullBash": true
+      "readOnlyDespiteFullBash": true,
+      "keywords": [
+        "review",
+        "code analysis",
+        "quality",
+        "security review"
+      ],
+      "allowMentions": [
+        "fix",
+        "implement"
+      ],
+      "neverDo": [
+        "apply correction",
+        "implement feature",
+        "modify code"
+      ]
     },
     "debugger": {
       "role": "diagnosis",
@@ -109,7 +141,30 @@
           "feasibility_spike": "spiker"
         }
       },
-      "readOnlyDespiteFullBash": true
+      "readOnlyDespiteFullBash": true,
+      "keywords": [
+        "debug",
+        "analyze",
+        "root cause",
+        "why it crashes",
+        "errors",
+        "stack trace",
+        "diagnostics",
+        "identify",
+        "find"
+      ],
+      "allowMentions": [
+        "fix",
+        "test",
+        "error"
+      ],
+      "neverDo": [
+        "apply fix",
+        "implement fix",
+        "modify code",
+        "write test",
+        "run test"
+      ]
     },
     "doc-writer": {
       "role": "documentation",
@@ -146,7 +201,43 @@
           "ui_prototyping": "sketcher",
           "feasibility_spike": "spiker"
         }
-      }
+      },
+      "keywords": [
+        "documentation",
+        "readme",
+        "manual",
+        "guides",
+        "api docs",
+        "docs",
+        "update docs",
+        "write documentation",
+        "status_report",
+        "changelog",
+        "sessions",
+        "planning files",
+        "state.md",
+        "restore file",
+        "update report",
+        "write report",
+        "generate report"
+      ],
+      "allowMentions": [
+        "fix",
+        "test",
+        "code",
+        "verify",
+        "validate",
+        "check",
+        "review",
+        "diagnosis",
+        "bug",
+        "error"
+      ],
+      "neverDo": [
+        "apply fix",
+        "perform diagnosis",
+        "execute code modification"
+      ]
     },
     "executor": {
       "role": "implementation",
@@ -158,6 +249,7 @@
       "canDelegateTo": [
         "*"
       ],
+      "trustedForSecrets": true,
       "canPreDelegate": false,
       "writeScope": "all",
       "delegation_rules": {
@@ -181,7 +273,58 @@
           "feasibility_spike": "spiker"
         }
       },
-      "noTestExecution": true
+      "noTestExecution": true,
+      "keywords": [
+        "fix",
+        "implement",
+        "modify",
+        "add",
+        "refactor",
+        "apply",
+        "commit",
+        "copy",
+        "backup",
+        "move",
+        "rename",
+        "create folder",
+        "replicate",
+        "mkdir",
+        "create",
+        "deploy",
+        "install",
+        "configure"
+      ],
+      "allowMentions": [
+        "diagnosis",
+        "analysis",
+        "documentation",
+        "test",
+        "readme",
+        "status",
+        "report"
+      ],
+      "neverDo": [
+        "perform diagnosis",
+        "write test",
+        "run test",
+        "write documentation",
+        "perform analysis",
+        "update readme",
+        "update docs",
+        "write manual",
+        "write readme",
+        "write status_report",
+        "update status_report",
+        "write changelog",
+        "update changelog",
+        "write sessions",
+        "update sessions",
+        "planning files",
+        "update state.md",
+        "restore file",
+        "write report",
+        "update report"
+      ]
     },
     "explorer": {
       "role": "research",
@@ -221,7 +364,29 @@
           "feasibility_spike": "spiker"
         }
       },
-      "readOnlyDespiteFullBash": true
+      "readOnlyDespiteFullBash": true,
+      "keywords": [
+        "explore",
+        "analysis",
+        "contextualize",
+        "where is",
+        "how it works",
+        "search",
+        "find",
+        "structure"
+      ],
+      "allowMentions": [
+        "fix",
+        "test",
+        "implement"
+      ],
+      "neverDo": [
+        "apply correction",
+        "implement feature",
+        "modify code",
+        "create file",
+        "write code"
+      ]
     },
     "security-auditor": {
       "role": "audit security",
@@ -256,7 +421,22 @@
           "feasibility_spike": "spiker"
         }
       },
-      "readOnlyDespiteFullBash": true
+      "readOnlyDespiteFullBash": true,
+      "keywords": [
+        "security",
+        "vulnerability",
+        "audit",
+        "owasp"
+      ],
+      "allowMentions": [
+        "fix",
+        "implement"
+      ],
+      "neverDo": [
+        "apply correction",
+        "implement feature",
+        "modify code"
+      ]
     },
     "sketcher": {
       "role": "UI prototypes",
@@ -292,7 +472,23 @@
           "code_review": "code-reviewer",
           "feasibility_spike": "spiker"
         }
-      }
+      },
+      "keywords": [
+        "mockup",
+        "wireframe",
+        "ui",
+        "ux",
+        "design",
+        "visual prototype"
+      ],
+      "allowMentions": [
+        "fix"
+      ],
+      "neverDo": [
+        "apply correction",
+        "implement backend",
+        "implement logic"
+      ]
     },
     "spiker": {
       "role": "throwaway prototypes",
@@ -304,6 +500,7 @@
       "canDelegateTo": [
         "*"
       ],
+      "trustedForSecrets": true,
       "canPreDelegate": false,
       "writeScope": "spikes",
       "delegation_rules": {
@@ -326,7 +523,18 @@
           "code_review": "code-reviewer",
           "ui_prototyping": "sketcher"
         }
-      }
+      },
+      "keywords": [
+        "prototype",
+        "spike",
+        "feasibility",
+        "feasibility test"
+      ],
+      "allowMentions": [],
+      "neverDo": [
+        "fix real project",
+        "modify main codebase"
+      ]
     },
     "tester": {
       "role": "test writing",
@@ -360,7 +568,27 @@
           "ui_prototyping": "sketcher",
           "feasibility_spike": "spiker"
         }
-      }
+      },
+      "keywords": [
+        "write test",
+        "create test",
+        "e2e",
+        "maestro",
+        "playwright",
+        "coverage",
+        "scenario"
+      ],
+      "allowMentions": [
+        "test",
+        "run",
+        "verify"
+      ],
+      "neverDo": [
+        "run test",
+        "apply correction",
+        "perform diagnostic",
+        "modify source code"
+      ]
     },
     "verifier": {
       "role": "validation",
@@ -398,7 +626,27 @@
           "feasibility_spike": "spiker"
         }
       },
-      "readOnlyDespiteFullBash": true
+      "readOnlyDespiteFullBash": true,
+      "keywords": [
+        "verify",
+        "validate",
+        "run test",
+        "check",
+        "review",
+        "lint",
+        "screenshot"
+      ],
+      "allowMentions": [
+        "test",
+        "fix",
+        "run"
+      ],
+      "neverDo": [
+        "apply correction",
+        "write test",
+        "perform diagnostic",
+        "modify code"
+      ]
     }
   }
 }

@@ -1,7 +1,8 @@
 import { DelegationGuard } from './delegation-guard.js';
-import { readFileSync, existsSync, rmSync, mkdirSync, mkdtempSync } from 'node:fs';
+import { readFileSync, existsSync, rmSync, mkdirSync, mkdtempSync, copyFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 
 const mockClient = { tui: { showToast: async () => {} } };
 const testRoot = mkdtempSync(path.join(os.tmpdir(), 'delegation-guard-harness-'));
@@ -931,6 +932,832 @@ console.log('--- 21. UNKNOWN MCP TOOLS: observability only, no blocking (explici
       );
     });
   }
+}
+
+console.log('--- 22. neverDo enforcement + fallback safety-net (M2 regression) ---');
+{
+  // M2 (2026-09-10): neverDo/keywords/allowMentions live ONLY in guard-config.json
+  // (single source of truth, migrated from the old 325-line inline fallback);
+  // the fallback is now a MINIMAL safety-net (REV-03) — neverDo [], bashAllowlist []
+  // (total deny), delegation_rules can_handle_directly ['*'] (routing stays
+  // operational). VER-01: enforcement and fallback had ZERO regression coverage.
+  // 22.1/22.2 exercise the real guard-config.json via the shared `guard` (loaded
+  // from __dirname); 22.3/22.4 exercise the fallback via a COPY of the plugin in
+  // an empty temp dir (its __dirname has no guard-config.json → safety-net).
+
+  await expectBlock('22.1 executor "write documentation" blocked (neverDo from guard-config.json)', () =>
+    taskCall('executor', 'domain:implementation - write documentation',
+      'domain:implementation root cause known, write documentation'),
+    'RULE: executor cannot do "write documentation"');
+
+  await expectPass('22.2 executor "verify the fix and write report" passes (allowMention "report" + analytical verb bypass)', () =>
+    taskCall('executor', 'domain:implementation - verify and report',
+      'domain:implementation root cause known, verify the fix and write report'));
+
+  // Fallback: copy delegation-guard.js to an empty temp dir and import THE COPY
+  // (ESM dynamic import of a distinct URL = distinct module instance with its own
+  // module-level state, so the cached guard-config.json profiles of the shared
+  // guard cannot leak in; the copy's __dirname has no guard-config.json →
+  // safety-net fallback). process.chdir(testRoot) at the top of this harness does
+  // NOT matter: tryLoadGuardConfig only checks .opencode/plugins under the
+  // project directory (the temp worktree, not the cwd) and __dirname.
+  const fallbackDir = mkdtempSync(path.join(os.tmpdir(), 'delegation-guard-fallback-'));
+  try {
+    const copiedPlugin = path.join(fallbackDir, 'delegation-guard.js');
+    copyFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), 'delegation-guard.js'),
+      copiedPlugin
+    );
+    const { DelegationGuard: DelegationGuardFallback } = await import(pathToFileURL(copiedPlugin).href);
+    const guardFallback = await DelegationGuardFallback({
+      project: { id: 'test-project-neverdo-fallback' }, client: mockClient, $: async () => {},
+      directory: fallbackDir, worktree: fallbackDir
+    });
+    const beforeFB = guardFallback['tool.execute.before'];
+    const eventFB = guardFallback['event'];
+    const orchSessionFB = 'ses_orch_fallback';
+    const subSessionFB = 'ses_sub_fallback_executor';
+    // Register the child identity via the event hook (production mechanism,
+    // sections 10/12) so the bash check resolves 'executor' deterministically
+    // from the registry, not only from the currentActiveAgent bridge.
+    await eventFB({ event: { type: 'session.created', properties: { sessionID: subSessionFB, info: { agent: 'executor', parentID: orchSessionFB } } } });
+    // Preload conductor-rules on the fallback instance (gate 2.6, not the focus here)
+    callID++;
+    await beforeFB(
+      { tool: 'skill', sessionID: orchSessionFB, callID: 'call_' + callID },
+      { args: { name: 'conductor-rules' } }
+    );
+
+    await expectPass('22.3a fallback (config missing): delegation to executor stays operational (can_handle_directly ["*"])', () => {
+      callID++;
+      return beforeFB(
+        { tool: 'task', sessionID: orchSessionFB, callID: 'call_' + callID },
+        { args: { subagent_type: 'executor', description: 'domain:implementation - fallback', prompt: 'domain:implementation root cause known, fallback' } }
+      );
+    });
+
+    await expectBlock('22.3b fallback (config missing): bash total deny for executor (bashAllowlist [])', () => {
+      callID++;
+      return beforeFB(
+        { tool: 'bash', sessionID: subSessionFB, callID: 'call_' + callID, args: { command: 'npm install' } },
+        { args: { command: 'npm install' } }
+      );
+    }, 'total deny');
+
+    await expectPass('22.4 fallback (config missing): "write documentation" NOT blocked (neverDo [] — policy lives only in guard-config.json)', () => {
+      callID++;
+      return beforeFB(
+        { tool: 'task', sessionID: orchSessionFB, callID: 'call_' + callID },
+        { args: { subagent_type: 'executor', description: 'domain:implementation - fallback neverdo', prompt: 'domain:implementation root cause known, write documentation' } }
+      );
+    });
+  } finally {
+    rmSync(fallbackDir, { recursive: true, force: true });
+  }
+}
+
+console.log('--- 23. --continue identity fallback: pre-existing session without identity sources (M5 regression) ---');
+{
+  // M5 (2026-09-10): __injectedAgent/__isOrchestrator removed from the identity
+  // chain (dead code — never populated by upstream, see REV-06). This section pins
+  // the REAL behavior of the reduced chain (registryAgent || state.lastAgent ||
+  // getCurrentActiveAgent()) for a session reopened with --continue when the plugin
+  // was loaded AFTER the session was born: no session.created ever observed by this
+  // plugin instance, no state.lastAgent, no delegation yet in this instance
+  // (currentActiveAgent = null).
+  // Observed behavior (probe 2026-09-10): caller = null → isOrchestrator fallback
+  // (!caller && !state.lastAgent) = true → check 2.5 blocks ALL mutative tools as
+  // orchestrator_direct_tool (fail-closed), while read stays allowed (safe
+  // gray-zone). REV-06: currentActiveAgent/lastAgent fallbacks are KEPT and are
+  // the only identity recovery for --continue — pinned in 23.2.
+  const guardCont = await DelegationGuard({
+    project: { id: 'test-project-continue-fallback' }, client: mockClient, $: async () => {},
+    directory: projectRoot('continue-fallback'), worktree: projectRoot('continue-fallback')
+  });
+  const beforeCont = guardCont['tool.execute.before'];
+  const preExistingSession = 'ses_pre_existing_child'; // born BEFORE this plugin instance
+
+  await expectBlock('23.1a pre-existing session (--continue), no identity source: bash BLOCKED (fail-closed, orchestrator_direct_tool)', () => {
+    callID++;
+    return beforeCont(
+      { tool: 'bash', sessionID: preExistingSession, callID: 'call_' + callID, args: { command: 'npm install' } },
+      { args: { command: 'npm install' } }
+    );
+  }, 'Delegate instead of using bash directly');
+
+  await expectBlock('23.1b pre-existing session (--continue), no identity source: edit BLOCKED', () => {
+    callID++;
+    return beforeCont(
+      { tool: 'edit', sessionID: preExistingSession, callID: 'call_' + callID, args: { filePath: 'app.js', oldString: 'a', newString: 'b' } },
+      { args: { filePath: 'app.js', oldString: 'a', newString: 'b' } }
+    );
+  }, 'Delegate instead of using edit directly');
+
+  await expectBlock('23.1c pre-existing session (--continue), no identity source: write BLOCKED', () => {
+    callID++;
+    return beforeCont(
+      { tool: 'write', sessionID: preExistingSession, callID: 'call_' + callID, args: { filePath: 'notes.md', content: 'x' } },
+      { args: { filePath: 'notes.md', content: 'x' } }
+    );
+  }, 'Delegate instead of using write directly');
+
+  await expectPass('23.1d pre-existing session (--continue), no identity source: read allowed (safe gray-zone, pinned current behavior)', () => {
+    callID++;
+    return beforeCont(
+      { tool: 'read', sessionID: preExistingSession, callID: 'call_' + callID, args: { filePath: 'README.md' } },
+      { args: { filePath: 'README.md' } }
+    );
+  });
+
+  // 23.2 — bridge fallback (REV-06: kept as a VALID fallback): after a delegation,
+  // currentActiveAgent resolves the pre-existing session's identity even without
+  // registry/lastAgent. Mutative tools are then governed by the delegated agent's
+  // profile (executor bashAllowlist ["*"]) instead of being fail-closed.
+  const orchSessionCont = 'ses_orch_continue_fallback';
+  await preloadConductorRules(guardCont, orchSessionCont);
+  callID++;
+  await beforeCont(
+    { tool: 'task', sessionID: orchSessionCont, callID: 'call_' + callID },
+    { args: { subagent_type: 'executor', description: 'domain:implementation - continue fallback', prompt: 'domain:implementation root cause known, continue fallback' } }
+  );
+  await expectPass('23.2 pre-existing session AFTER a delegation: currentActiveAgent bridge resolves executor, bash passes per its profile (fallback pinned)', () => {
+    callID++;
+    return beforeCont(
+      { tool: 'bash', sessionID: preExistingSession, callID: 'call_' + callID, args: { command: 'npm install' } },
+      { args: { command: 'npm install' } }
+    );
+  });
+}
+
+console.log('--- 24. Unknown identity: write + webfetch fail-closed (M1 + REV-05 regression) ---');
+{
+  // M1 + REV-05 (2026-09-10): at unknown identity bash/edit/rm were already
+  // blocked downstream (bash_block/edit_block/tool_phase), but WRITE fell
+  // through to checkWritePath("unknown", ...) — the only real mutative hole
+  // (REV-01) — and webfetch passed with a 'grey_zone' allow entry and NO
+  // check (REV-05). Both are now fail-closed in the dispatcher, specular to
+  // the edit pattern.
+  // Fresh instance: the shared `guard` has currentActiveAgent set by earlier
+  // delegations (TTL 5 min), which would "heal" an unknown session's identity
+  // and hide the hole. Here the only identity source is the ROOT
+  // session.created (sets orchestratorSessionID, sets NO currentActiveAgent),
+  // so the unknown session resolves: subagentType=null, isOrchestrator=false
+  // (its sessionID differs from the orchestrator's) → the real gray zone.
+  const guardU = await DelegationGuard({
+    project: { id: 'test-project-unknown-identity' }, client: mockClient, $: async () => {},
+    directory: projectRoot('unknown-identity'), worktree: projectRoot('unknown-identity')
+  });
+  const beforeU = guardU['tool.execute.before'];
+  const eventU = guardU['event'];
+  const orchSess24 = 'ses_orch_unknown_identity';
+  await eventU({ event: { type: 'session.created', properties: { sessionID: orchSess24, info: { agent: 'orchestrator' } } } });
+  const unknownSess = 'ses_unknown_gray_24';
+
+  await expectBlock('24.1 unknown identity: write on a clean new file BLOCKED (was the M1 hole — passed via checkWritePath("unknown"))', () => {
+    callID++;
+    return beforeU(
+      { tool: 'write', sessionID: unknownSess, callID: 'call_' + callID, args: { filePath: 'out-test.txt', content: 'x' } },
+      { args: { filePath: 'out-test.txt', content: 'x' } }
+    );
+  }, 'WRITE: unknown identity');
+
+  await expectBlock('24.2 unknown identity: webfetch BLOCKED (was a grey_zone allow entry with no check, REV-05)', () => {
+    callID++;
+    return beforeU(
+      { tool: 'webfetch', sessionID: unknownSess, callID: 'call_' + callID, args: { url: 'https://example.com' } },
+      { args: { url: 'https://example.com' } }
+    );
+  }, 'WEBFETCH: unknown identity');
+
+  // 24.3/24.4 — regressions: a legitimate REGISTERED child stays operational.
+  // executor: writeScope "all" + canWebfetch true (guard-config.json) → both
+  // the write and the webfetch must keep passing after the fail-closed fix.
+  const subSess24 = 'ses_sub_unknown_identity_executor';
+  await eventU({ event: { type: 'session.created', properties: { sessionID: subSess24, info: { agent: 'executor', parentID: orchSess24 } } } });
+
+  await expectPass('24.3 registered executor: write on a clean new in-project file stays allowed', () => {
+    callID++;
+    return beforeU(
+      { tool: 'write', sessionID: subSess24, callID: 'call_' + callID, args: { filePath: 'out-test-2.txt', content: 'x' } },
+      { args: { filePath: 'out-test-2.txt', content: 'x' } }
+    );
+  });
+
+  await expectPass('24.4 registered executor (canWebfetch: true): webfetch stays allowed', () => {
+    callID++;
+    return beforeU(
+      { tool: 'webfetch', sessionID: subSess24, callID: 'call_' + callID, args: { url: 'https://example.com' } },
+      { args: { url: 'https://example.com' } }
+    );
+  });
+}
+
+console.log('--- 25. Webfetch schema check: single point in dispatcher (M3 dedup, REV-02) ---');
+{
+  // M3/REV-02 (2026-09-10): the URL schema check (http/https only) existed in
+  // TWO places — the dispatcher (runs for EVERY identity branch: orchestrator,
+  // unknown, profile) and a duplicate INSIDE checkWebfetch. The duplicate is
+  // removed; these tests pin that the dispatcher check alone protects all
+  // three paths. Fresh instance: the only identity source is session.created,
+  // so currentActiveAgent residue from earlier sections cannot heal anything.
+  const guardS = await DelegationGuard({
+    project: { id: 'test-project-webfetch-schema' }, client: mockClient, $: async () => {},
+    directory: projectRoot('webfetch-schema'), worktree: projectRoot('webfetch-schema')
+  });
+  const beforeS = guardS['tool.execute.before'];
+  const eventS = guardS['event'];
+
+  // 25.1 — ORCHESTRATOR identity: schema check runs BEFORE the orchestrator
+  // allow branch, so file:// is blocked even for the orchestrator. Pins the
+  // REV-02 direction: removing the checkWebfetch duplicate must NOT open
+  // non-http schemes to orchestrator sessions.
+  const orchSess25 = 'ses_orch_webfetch_schema';
+  await eventS({ event: { type: 'session.created', properties: { sessionID: orchSess25, info: { agent: 'orchestrator' } } } });
+  await expectBlock('25.1 orchestrator: webfetch file:///etc/passwd BLOCKED by dispatcher schema check', () => {
+    callID++;
+    return beforeS(
+      { tool: 'webfetch', sessionID: orchSess25, callID: 'call_' + callID, args: { url: 'file:///etc/passwd' } },
+      { args: { url: 'file:///etc/passwd' } }
+    );
+  }, 'WEBFETCH: URL scheme not allowed');
+
+  // 25.2 — UNKNOWN identity: dispatcher schema check runs BEFORE the unknown
+  // branch (webfetch_block REV-05), so the real message is the SCHEMA one,
+  // not the unknown-identity one. Pins the order.
+  const unknownSess25 = 'ses_unknown_webfetch_schema';
+  await expectBlock('25.2 unknown identity: webfetch file:///C:/Windows/win.ini BLOCKED by schema (schema check precedes unknown branch)', () => {
+    callID++;
+    return beforeS(
+      { tool: 'webfetch', sessionID: unknownSess25, callID: 'call_' + callID, args: { url: 'file:///C:/Windows/win.ini' } },
+      { args: { url: 'file:///C:/Windows/win.ini' } }
+    );
+  }, 'WEBFETCH: URL scheme not allowed');
+
+  // 25.3 — REGISTERED profiled agent (executor, canWebfetch: true): the
+  // removed duplicate used to be the only schema check this path had AFTER
+  // canWebfetch... it never was — the dispatcher check also ran first here.
+  // Post-dedup ftp:// must stay blocked: dispatcher is now the ONLY line of
+  // defense for this path, and it holds.
+  const subSess25 = 'ses_sub_webfetch_schema_executor';
+  await eventS({ event: { type: 'session.created', properties: { sessionID: subSess25, info: { agent: 'executor', parentID: orchSess25 } } } });
+  await expectBlock('25.3 registered executor (canWebfetch: true): webfetch ftp://example.com BLOCKED by dispatcher schema check', () => {
+    callID++;
+    return beforeS(
+      { tool: 'webfetch', sessionID: subSess25, callID: 'call_' + callID, args: { url: 'ftp://example.com' } },
+      { args: { url: 'ftp://example.com' } }
+    );
+  }, 'WEBFETCH: URL scheme not allowed');
+
+  // 25.4 — REGRESSION: legitimate https webfetch for a registered canWebfetch
+  // agent still passes through the full post-dedup flow (dispatcher schema
+  // check → checkWebfetch → canWebfetch allow) with no duplicate in between.
+  await expectPass('25.4 registered executor: https webfetch still passes (full flow post-dedup, no duplicates)', () => {
+    callID++;
+    return beforeS(
+      { tool: 'webfetch', sessionID: subSess25, callID: 'call_' + callID, args: { url: 'https://example.com' } },
+      { args: { url: 'https://example.com' } }
+    );
+  });
+}
+
+console.log('--- 26. SUB-DELEGATION backstop pinned (M4/REV-04) ---');
+{
+  // M4/REV-04 (2026-09-10): checkTaskSubDelegation (:2215) and checkDelegationLoop
+  // (:737) were candidate dead code — unreachable via the native task:deny on
+  // child sessions (OpenCode 1.18.30) — but are KEPT as a defensive backstop:
+  // an agent-level allow (permission task:allow) can structurally bypass the
+  // native deny (evidence D4), and no agent profile today carries task:allow.
+  // These tests PIN the backstop so a future drift (a permissive custom agent
+  // config, a regression in the sub_delegation gate ordering) cannot silently
+  // remove the last line of defense. Invariant documented in docs/SECURITY.md.
+  //
+  // Fresh instance: identity resolution uses ONLY the session.created registry
+  // (no currentActiveAgent residue from earlier sections).
+  const guard26 = await DelegationGuard({
+    project: { id: 'test-project-subdelegation-backstop' }, client: mockClient, $: async () => {},
+    directory: projectRoot('subdelegation-backstop'), worktree: projectRoot('subdelegation-backstop')
+  });
+  const before26 = guard26['tool.execute.before'];
+  const event26 = guard26['event'];
+
+  const orchSess26 = 'ses_orch_subdeleg_backstop';
+  // Root session: registers orchestratorSessionID via the production mechanism.
+  await event26({ event: { type: 'session.created', properties: { sessionID: orchSess26, info: { agent: 'orchestrator' } } } });
+
+  // Conductor-rules gate (2.6): preload on the root session — not the focus
+  // of this section, same pattern as every other section (see section 8/9).
+  await preloadConductorRules(guard26, orchSess26);
+
+  // The Orchestrator legitimately delegates to verifier (in canDelegateTo of
+  // nothing needed here — the ROOT is exempt from the sub-delegation gate:
+  // the gate requires state.lastAgent to be set, which only happens on a
+  // crystallized CHILD session).
+  callID++;
+  await before26(
+    { tool: 'task', sessionID: orchSess26, callID: 'call_' + callID },
+    { args: { subagent_type: 'verifier', description: 'domain:verification - setup verifier child', prompt: 'domain:verification verify the applied fix' } }
+  );
+
+  // Child verifier session registered via session.created (registry identity,
+  // same production mechanism) and crystallized with a real tool call
+  // (state.lastAgent = 'verifier') — the exact state in which the
+  // sub_delegation backstop becomes reachable.
+  const verifierSess26 = 'ses_sub_verifier_backstop';
+  await event26({ event: { type: 'session.created', properties: { sessionID: verifierSess26, info: { parentID: orchSess26, agent: 'verifier' } } } });
+  callID++;
+  await before26(
+    { tool: 'read', sessionID: verifierSess26, callID: 'call_' + callID, args: { filePath: 'report.txt' } },
+    { args: { filePath: 'report.txt' } }
+  );
+
+  // 26.1 — verifier -> sketcher: NOT in verifier.canDelegateTo
+  // ["executor","doc-writer"] → BLOCK by checkTaskSubDelegation. Prompt
+  // engineered to reach the sub_delegation check clean (no earlier throw):
+  //   - domain:ui_prototyping → sketcher.can_handle_directly (delegation_rules OK
+  //     for the TARGET profile — the caller's rules are not evaluated here)
+  //   - no .md/.txt mention + no write verb of isDocumentationTask → routing OK
+  //   - no verifier/sketcher neverDo phrase → neverdo OK
+  //   - delegationStack empty (root delegation resets it) → anti_loop OK
+  //   - no "fix" in the text → workflow OK (only executor has a workflow rule anyway)
+  await expectBlock('26.1 crystallized verifier delegates to sketcher (NOT in canDelegateTo) BLOCKED by sub-delegation backstop', () => {
+    callID++;
+    return before26(
+      { tool: 'task', sessionID: verifierSess26, callID: 'call_' + callID },
+      { args: { subagent_type: 'sketcher', description: 'domain:ui_prototyping - draft a wireframe', prompt: 'domain:ui_prototyping draft a wireframe for the settings panel' } }
+    );
+  }, 'SUB-DELEGATION: verifier cannot delegate to sketcher');
+
+  // 26.2 — root Orchestrator -> executor: the legitimate delegation path must
+  // NOT be caught by the backstop (regression guard: the gate keys on
+  // state.lastAgent of the CALLER session, which is null for the root).
+  // domain:implementation + "root cause known" satisfies executor's workflow
+  // rule (requiresAnyOf) — full clean path to the delegation being executed.
+  await expectPass('26.2 orchestrator root delegates executor domain:implementation PASSES (legitimate delegation not blocked by the backstop)', () => {
+    callID++;
+    return before26(
+      { tool: 'task', sessionID: orchSess26, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - apply fix', prompt: 'domain:implementation root cause: misaligned handler, apply fix to the handler module' } }
+    );
+  });
+}
+
+console.log('--- 27. REV-09 trustedForSecrets: explicit trust flag, never derived ---');
+{
+  // REV-09 (2026-09-10): the checkSecretsInOutput skip previously derived
+  // from canDelegateTo:["*"] — any permissive custom agent would inherit
+  // the secret-scan exemption without a real trust decision. Trust is now
+  // an EXPLICIT per-agent flag (`trustedForSecrets: true` in
+  // guard-config.json; the M2 safety-net fallback never sets it).
+  // Pin: 27.1 executor (has the flag) → output NOT redacted (skip active);
+  // 27.2 verifier (canDelegateTo ["executor"] — NOT the flag) → same
+  // output gets redacted (scan active). Same simulation style as sections
+  // 18/19: tool.execute.after with a real secret pattern in output.
+  const guard27 = await DelegationGuard({
+    project: { id: 'test-project-rev09-trusted-secrets' }, client: mockClient, $: async () => {},
+    directory: projectRoot('rev09-trusted-secrets'), worktree: projectRoot('rev09-trusted-secrets')
+  });
+  const event27 = guard27['event'];
+  const before27 = guard27['tool.execute.before'];
+  const after27 = guard27['tool.execute.after'];
+
+  const realSecret = 'sk-' + 'a'.repeat(48); // same shape as section 19 (OpenAI)
+  const makeOutput = () => ({ args: { filePath: 'config.txt' }, output: `value: ${realSecret}` });
+  // Crystallize state.lastAgent for a child session via the production
+  // mechanism (registry from session.created + a first harmless tool call —
+  // same pattern as section 19, lines ~860).
+  const crystallize27 = async (sess) => {
+    callID++;
+    await before27(
+      { tool: 'read', sessionID: sess, callID: 'call_' + callID, args: { filePath: 'README.md' } },
+      { args: { filePath: 'README.md' } }
+    );
+  };
+
+  // 27.1 — executor: trustedForSecrets:true → skip active, output untouched.
+  {
+    const sess = 'ses_sub_rev09_executor';
+    await event27({ event: { type: 'session.created', properties: { sessionID: sess, info: { agent: 'executor', parentID: 'ses_orch_rev09' } } } });
+    await crystallize27(sess);
+    const out = makeOutput();
+    await after27({ tool: 'read', sessionID: sess }, out);
+    await expectPass('27.1 executor (trustedForSecrets:true) output with a real secret is NOT redacted (explicit trust pinned)', () => {
+      if (out.output.includes('REDACTED')) {
+        throw new Error(`expected NO redaction for the trusted agent, found: ${out.output}`);
+      }
+    });
+  }
+
+  // 27.2 — verifier: canDelegateTo:["executor"] (no "*", no flag) → scan
+  // active. Pin del flusso already-scanned: identical block/redact path.
+  {
+    const sess = 'ses_sub_rev09_verifier';
+    await event27({ event: { type: 'session.created', properties: { sessionID: sess, info: { agent: 'verifier', parentID: 'ses_orch_rev09' } } } });
+    await crystallize27(sess);
+    const out = makeOutput();
+    await after27({ tool: 'read', sessionID: sess }, out);
+    await expectPass('27.2 verifier (NOT trusted) same output gets REDACTED (scan active for all non-trusted agents)', () => {
+      if (!out.output.includes('REDACTED')) {
+        throw new Error(`expected REDACTED for the non-trusted agent, found: ${out.output}`);
+      }
+    });
+  }
+
+  // 27.3 — regression pin of the REV-09 semantics itself: NO agent without
+  // the explicit flag can reach the skip, even with a wildcard-looking
+  // capability elsewhere. debugger has bashAllowlist-free read-only
+  // profile — scan must stay active (same expectation as 19.x).
+  {
+    const sess = 'ses_sub_rev09_debugger';
+    await event27({ event: { type: 'session.created', properties: { sessionID: sess, info: { agent: 'debugger', parentID: 'ses_orch_rev09' } } } });
+    await crystallize27(sess);
+    const out = makeOutput();
+    await after27({ tool: 'read', sessionID: sess }, out);
+    await expectPass('27.3 debugger (NOT trusted) scan stays active — trust never derived from other capabilities', () => {
+      if (!out.output.includes('REDACTED')) {
+        throw new Error(`expected REDACTED for the non-trusted agent, found: ${out.output}`);
+      }
+    });
+  }
+}
+
+// ============================================================
+// 28. VER-M2-02: currentActiveAgent bridge on the FALLBACK instance
+// ============================================================
+console.log('--- 28. Bridge fallback (currentActiveAgent) on the FALLBACK instance (VER-M2-02) ---');
+{
+  // GAP closed here: 22.3 exercised the fallback instance with REGISTRY
+  // identity (session.created), 23.2 exercised the currentActiveAgent
+  // bridge but ONLY on the NORMAL instance (guard-config.json profiles).
+  // The bridge path on the fallback instance (safety-net profiles,
+  // bashAllowlist []) was never covered. 28.1 pins exactly that
+  // intersection: identity resolvable ONLY via the bridge (a delegation
+  // happened, no session.created for the child session) on an instance
+  // whose profiles are the M2 safety-net.
+  const fallbackDir28 = mkdtempSync(path.join(os.tmpdir(), 'delegation-guard-fallback-bridge-'));
+  try {
+    const copiedPlugin28 = path.join(fallbackDir28, 'delegation-guard.js');
+    copyFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), 'delegation-guard.js'),
+      copiedPlugin28
+    );
+    const { DelegationGuard: DelegationGuardFallback28 } = await import(pathToFileURL(copiedPlugin28).href);
+    const guardFB28 = await DelegationGuardFallback28({
+      project: { id: 'test-project-bridge-fallback-28' }, client: mockClient, $: async () => {},
+      directory: fallbackDir28, worktree: fallbackDir28
+    });
+    const beforeFB28 = guardFB28['tool.execute.before'];
+    const eventFB28 = guardFB28['event'];
+    const orchSession28 = 'ses_orch_fallback_bridge_28';
+    // Register ONLY the root orchestrator session via session.created —
+    // the child session below gets NO session.created (that is the point:
+    // the bridge is its only identity source).
+    await eventFB28({ event: { type: 'session.created', properties: { sessionID: orchSession28, info: { agent: 'orchestrator' } } } });
+    // Preload conductor-rules on the root (gate 2.6, not the focus here —
+    // same pattern as 22.3: the skill preload also flips
+    // state.conductorRulesLoaded for the root session).
+    callID++;
+    await beforeFB28(
+      { tool: 'skill', sessionID: orchSession28, callID: 'call_' + callID },
+      { args: { name: 'conductor-rules' } }
+    );
+
+    // 28.1 — the delegation to executor: the ONLY identity write for the
+    // child session is the currentActiveAgent bridge (pendingAgentTypes.set
+    // + currentActiveAgent = 'executor' in the task dispatcher). The
+    // routing itself must stay operational on the fallback
+    // (delegation_rules can_handle_directly ['*'], REV-03).
+    await expectPass('28.1a fallback instance: delegation to executor stays operational (bridge setup, can_handle_directly ["*"])', () => {
+      callID++;
+      return beforeFB28(
+        { tool: 'task', sessionID: orchSession28, callID: 'call_' + callID },
+        { args: { subagent_type: 'executor', description: 'domain:implementation - fallback bridge', prompt: 'domain:implementation root cause known, fallback bridge test' } }
+      );
+    });
+
+    // The child session never gets a session.created event — its identity
+    // is resolvable ONLY via the currentActiveAgent bridge. The first
+    // non-task tool call crystallizes state.lastAgent from the bridge
+    // (identity lock, source=currentActive) and the bash check then runs
+    // against the FALLBACK executor profile: bashAllowlist [] → total deny.
+    // Pin the REAL bridge+fallback behavior: the block comes from
+    // checkBashWhitelist with the safety-net role — NOT from the unknown
+    // branch ("The Orchestrator cannot use the shell"), which is what a
+    // null bridge would produce.
+    const bridgeSession28 = 'ses_sub_fallback_bridge_never_registered';
+    await expectBlock('28.1b bridge on FALLBACK instance: bash via currentActiveAgent-only identity BLOCKED by total deny (bashAllowlist [])', () => {
+      callID++;
+      return beforeFB28(
+        { tool: 'bash', sessionID: bridgeSession28, callID: 'call_' + callID, args: { command: 'npm install' } },
+        { args: { command: 'npm install' } }
+      );
+    }, 'total deny');
+
+    // 28.2 — same intersection, read side: read-only tools stay allowed
+    // for a bridge-resolved identity even on the fallback instance (safe
+    // gray-zone semantics, same expectation as 23.1d/22.3 flows).
+    await expectPass('28.2 bridge on FALLBACK instance: read via bridge-resolved executor stays allowed', () => {
+      callID++;
+      return beforeFB28(
+        { tool: 'read', sessionID: bridgeSession28, callID: 'call_' + callID, args: { filePath: 'README.md' } },
+        { args: { filePath: 'README.md' } }
+      );
+    });
+  } finally {
+    rmSync(fallbackDir28, { recursive: true, force: true });
+  }
+}
+
+console.log('--- 29. Blocked delegation must not arm the identity bridge (REV-01) ---');
+{
+  // A delegation rejected by ANY task-handler check (routing / unknown_agent /
+  // neverDo / delegation_rules) must leave NO residue in currentActiveAgent.
+  // Before the fix, :1159 armed the bridge BEFORE validation and the rollback
+  // (:1563) cleared only pendingAgentTypes, so the next unregistered session
+  // resolved the rejected target, crystallized it permanently (:1052) and got
+  // its full profile — write via checkWritePath (validatePathZone never reads
+  // agentProfiles), bash via checkBashWhitelist. Fail-closed inverted.
+  const guard29 = await DelegationGuard({
+    project: { id: 'test-project-residue-29' }, client: mockClient, $: async () => {},
+    directory: projectRoot('residue29'), worktree: projectRoot('residue29')
+  });
+  const before29 = guard29['tool.execute.before'];
+  const event29 = guard29['event'];
+  const orch29 = 'ses_orch_residue_29';
+  await event29({ event: { type: 'session.created', properties: { sessionID: orch29, info: { agent: 'orchestrator' } } } });
+  await preloadConductorRules(guard29, orch29);
+  const unknown29 = 'ses_unknown_residue_29';
+
+  await expectBlock('29.1 baseline (no residue yet): unknown identity write BLOCKED', () => {
+    callID++;
+    return before29(
+      { tool: 'write', sessionID: unknown29, callID: 'call_' + callID, args: { filePath: 'out-29.txt', content: 'x' } },
+      { args: { filePath: 'out-29.txt', content: 'x' } }
+    );
+  }, 'WRITE: unknown identity');
+
+  // Real-world trigger: routing block on a documentation-ish prompt
+  // (isDocumentationTask false positive — documented recurring case).
+  await expectBlock('29.2 delegation to executor BLOCKED by routing', () => {
+    callID++;
+    return before29(
+      { tool: 'task', sessionID: orch29, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'write the README.md documentation text file', prompt: 'please write and update the README.md documentation notes file only' } }
+    );
+  }, 'Documentation task detected');
+
+  await expectBlock('29.3 unknown identity AFTER a blocked delegation: write STILL BLOCKED (no executor residue)', () => {
+    callID++;
+    return before29(
+      { tool: 'write', sessionID: unknown29, callID: 'call_' + callID, args: { filePath: 'src/app-29.js', content: 'x' } },
+      { args: { filePath: 'src/app-29.js', content: 'x' } }
+    );
+  }, 'WRITE: unknown identity');
+
+  await expectBlock('29.4 unknown identity AFTER a blocked delegation: bash STILL BLOCKED', () => {
+    callID++;
+    return before29(
+      { tool: 'bash', sessionID: unknown29, callID: 'call_' + callID, args: { command: 'npm install' } },
+      { args: { command: 'npm install' } }
+    );
+  });
+
+  // 29.5 regression guard: the LEGITIMATE bridge (successful delegation) must
+  // keep working — pins the same behavior as 23.2/28.1b on a fresh session.
+  const bridge29 = 'ses_bridge_residue_29';
+  await expectPass('29.5a successful executor delegation stays operational', () => {
+    callID++;
+    return before29(
+      { tool: 'task', sessionID: orch29, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - residue', prompt: 'domain:implementation root cause known, residue test' } }
+    );
+  });
+  await expectPass('29.5b legitimate bridge intact: unregistered child resolves executor, bash passes per profile', () => {
+    callID++;
+    return before29(
+      { tool: 'bash', sessionID: bridge29, callID: 'call_' + callID, args: { command: 'npm install' } },
+      { args: { command: 'npm install' } }
+    );
+  });
+}
+
+// 30.1c scenario note (VER-LOW-01): the `parallel_identity_conflict` gate
+// (:1145) filters `t !== targetAgent`, so a same-type swarm (executor×2)
+// NEVER triggers it — the second delegation arms and only the routing check
+// inside the task-handler try can throw, exercising the catch rollback.
+console.log('--- 30. Same-type swarm rollback must not clobber the sibling bridge (VER-LOW-01) + unified targetAgent extraction (VER-LOW-02) ---');
+{
+  const guard30 = await DelegationGuard({
+    project: { id: 'test-project-residue-30' }, client: mockClient, $: async () => {},
+    directory: projectRoot('residue30'), worktree: projectRoot('residue30')
+  });
+  const before30 = guard30['tool.execute.before'];
+  const event30 = guard30['event'];
+  const orch30 = 'ses_orch_residue_30';
+  await event30({ event: { type: 'session.created', properties: { sessionID: orch30, info: { agent: 'orchestrator' } } } });
+  await preloadConductorRules(guard30, orch30);
+  const unknown30 = 'ses_unknown_residue_30';
+
+  // 30.1 — VER-LOW-01: two PARALLEL delegations to the SAME type (executor×2,
+  // Swarm Mode — legitimate fan-out, see section 7), the first one valid, the
+  // second one blocked by routing. Before the fix, the catch's rollback
+  // matched `currentActiveAgent === targetAgent` (true — same type) and
+  // nulled the bridge the FIRST delegation had legitimately armed: the
+  // sibling child in flight degraded to unknown identity (fail-closed, but a
+  // wrongful clobber of a legitimate delegation's bridge).
+  await expectPass('30.1a parallel delegation 1 to executor SUCCEEDS (arms the bridge, like 29.5a)', () => {
+    callID++;
+    return before30(
+      { tool: 'task', sessionID: orch30, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - swarm step1', prompt: 'domain:implementation root cause known, swarm step1' } }
+    );
+  });
+
+  await expectBlock('30.1b parallel delegation 2 SAME TYPE blocked by routing (arming + throw inside the try)', () => {
+    callID++;
+    return before30(
+      { tool: 'task', sessionID: orch30, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'write the README.md documentation text file', prompt: 'please write and update the README.md documentation notes file only' } }
+    );
+  }, 'Documentation task detected');
+
+  // THE RED: pre-fix, the 30.1b catch nulls the bridge armed by 30.1a, so
+  // this unregistered sibling session resolves unknown identity and bash
+  // falls into the orchestrator_block branch ("cannot use the shell").
+  // Post-fix: the bridge owner (30.1a's callID) does not match 30.1b's, the
+  // sibling bridge survives, identity resolves executor (bashAllowlist ["*"]).
+  const bridge30 = 'ses_sub_swarm_sibling_30';
+  await expectPass('30.1c sibling bridge INTACT after same-type blocked rollback: unregistered session still resolves executor', () => {
+    callID++;
+    return before30(
+      { tool: 'bash', sessionID: bridge30, callID: 'call_' + callID, args: { command: 'npm install' } },
+      { args: { command: 'npm install' } }
+    );
+  });
+  // 30.1d intentionally omitted: the proprietary rollback (delegation that
+  // DID arm the bridge, then gets blocked) is already pinned by 29.3/29.4;
+  // a "post-30.1b write" pin would pass under BOTH bug and fix (executor
+  // bridge intact → write per profile), adding no discriminating coverage.
+
+  // 30.2 — VER-LOW-02: the task handler extracted targetAgent ONLY from
+  // output.args (:1399) while the arming block also read input.args (:1139).
+  // A delegation with subagent_type ONLY in input.args armed the bridge and
+  // then hit the early return — no validation, no rollback, TTL-bounded
+  // residue. The unified extractor routes it through the full validation.
+  await expectBlock('30.2a delegation with subagent_type ONLY in input.args to a NON-EXISTENT agent: BLOCKED (unknown_agent), not silently passed', () => {
+    callID++;
+    return before30(
+      { tool: 'task', sessionID: orch30, callID: 'call_' + callID, args: { subagent_type: 'bogus-agent-30', description: 'domain:implementation - bogus', prompt: 'domain:implementation root cause known, bogus agent test' } },
+      { args: { description: 'domain:implementation - bogus', prompt: 'domain:implementation root cause known, bogus agent test' } }
+    );
+  }, 'does not exist in guard-config.json');
+
+  // Residue pin: pre-fix 30.2a silently early-returned leaving a stale
+  // pendingAgentTypes entry for 'bogus-agent-30' — no rollback ever fired.
+  // Side effect observable in the SAME fresh instance: the residue is a
+  // DIFFERENT type from any legit delegation, so the next delegation to a
+  // different agent must NOT trigger PARALLEL CONFLICT. (Pre-fix this test
+  // fails with PARALLEL CONFLICT — direct symptom of the VER-LOW-02 residue.)
+  await expectPass('30.2b no stale pending residue after input.args-only delegation flow: different-type delegation unaffected', () => {
+    callID++;
+    return before30(
+      { tool: 'task', sessionID: orch30, callID: 'call_' + callID },
+      { args: { subagent_type: 'verifier', description: 'domain:verification - verify residue', prompt: 'domain:verification verify the residue behavior' } }
+    );
+  });
+  // Fast-release the verifier pending (realistic production flow, same
+  // pattern as section 8: the child's session.created clears the pending
+  // entry) so the next DIFFERENT-type delegation does not hit the
+  // parallel_identity_conflict gate for reasons unrelated to these pins.
+  const verifierSession30 = 'ses_sub_verifier_residue_30';
+  await event30({ event: { type: 'session.created', properties: { sessionID: verifierSession30, info: { parentID: orch30, agent: 'verifier' } } } });
+
+  // 30.2c — no over-block: a LEGITIMATE delegation with subagent_type only
+  // in input.args (output.args carries description/prompt, the realistic
+  // split between the two sources) must pass the unified flow. Pre-fix this
+  // fails with PARALLEL CONFLICT against the stale 'bogus-agent-30' pending.
+  await expectPass('30.2c legitimate input.args-only delegation to executor passes the unified extraction', () => {
+    callID++;
+    return before30(
+      { tool: 'task', sessionID: orch30, callID: 'call_' + callID, args: { subagent_type: 'executor', description: 'domain:implementation - step2', prompt: 'domain:implementation root cause known, input-args step2' } },
+      { args: { description: 'domain:implementation - step2', prompt: 'domain:implementation root cause known, input-args step2' } }
+    );
+  });
+}
+
+// 31. REV-02: the single orchestratorSessionID slot is overwritten
+// unconditionally at every session.created root (:1750) and by any
+// unregistered session calling task (:1204). With two roots in the same
+// plugin instance, the FIRST loses orchestrator status: check 2.5 stops
+// covering it AND the anti-crystallization guard (:1079) stops protecting
+// it — it crystallizes the bridge residue (executor after a successful
+// delegation) and gets permanent write/bash PASS-THROUGH with the
+// delegated agent's profile (reviewer scenario S7). Fix: rootSessions Set —
+// every root keeps orchestrator status; the legacy slot stays (first root)
+// for the other consumers.
+console.log('--- 31. Multi-root: every root session stays Orchestrator (REV-02) ---');
+{
+  const guard31 = await DelegationGuard({
+    project: { id: 'test-project-root31' }, client: mockClient, $: async () => {},
+    directory: projectRoot('root31'), worktree: projectRoot('root31')
+  });
+  const before31 = guard31['tool.execute.before'];
+  const event31 = guard31['event'];
+  const orchA = 'ses_orch_root31_A';
+  await event31({ event: { type: 'session.created', properties: { sessionID: orchA, info: { agent: 'orchestrator' } } } });
+  await preloadConductorRules(guard31, orchA);
+
+  // 31.1a — S7 setup: successful delegation from A arms the executor bridge.
+  await expectPass('31.1a root A delegates to executor SUCCEEDS (arms the bridge)', () => {
+    callID++;
+    return before31(
+      { tool: 'task', sessionID: orchA, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - root31', prompt: 'domain:implementation root cause known, multi-root test' } }
+    );
+  });
+
+  // Second root session B in the SAME plugin instance. Pre-fix this steals
+  // the single slot from A.
+  const orchB = 'ses_orch_root31_B';
+  await event31({ event: { type: 'session.created', properties: { sessionID: orchB, info: { agent: 'orchestrator' } } } });
+
+  // THE RED: pre-fix, A is no longer the Orchestrator, crystallizes the
+  // executor bridge residue on its first direct tool call and bash/write
+  // pass with the executor profile.
+  await expectBlock('31.1c root A bash after second root: STILL Orchestrator, must delegate', () => {
+    callID++;
+    return before31(
+      { tool: 'bash', sessionID: orchA, callID: 'call_' + callID, args: { command: 'node --version' } },
+      { args: { command: 'node --version' } }
+    );
+  }, 'Delegate instead of using bash directly');
+
+  await expectBlock('31.1d root A write after second root: STILL Orchestrator, must delegate', () => {
+    callID++;
+    return before31(
+      { tool: 'write', sessionID: orchA, callID: 'call_' + callID, args: { filePath: 'src/app-31.js', content: 'x' } },
+      { args: { filePath: 'src/app-31.js', content: 'x' } }
+    );
+  }, 'Delegate instead of using write directly');
+
+  // No over-scope: B is an Orchestrator too. Already true pre-fix via the
+  // stolen slot — must STAY true post-fix via the Set.
+  await expectBlock('31.1e root B bash: also an Orchestrator, blocked (no over-scope)', () => {
+    callID++;
+    return before31(
+      { tool: 'bash', sessionID: orchB, callID: 'call_' + callID, args: { command: 'node --version' } },
+      { args: { command: 'node --version' } }
+    );
+  }, 'Delegate instead of using bash directly');
+
+  // Anti-over-block regression: an unregistered child session still resolves
+  // the executor bridge — the fix must not block children.
+  await expectPass('31.1f unregistered child bash npm install: resolves executor via bridge, passes', () => {
+    callID++;
+    return before31(
+      { tool: 'bash', sessionID: 'ses_bridge_root31', callID: 'call_' + callID, args: { command: 'npm install' } },
+      { args: { command: 'npm install' } }
+    );
+  });
+
+  // 31.2 — hijack/--continue path (:1204): an UNREGISTERED session calling
+  // task self-promotes to root. Pre-fix it hijacked the single slot (X kept
+  // orchestrator status only until Y stole it in turn); post-fix it joins
+  // rootSessions permanently. 31.2a/31.2b were already green pre-fix (X
+  // owns the slot right after its own task) — pins of non-regression.
+  const sesX = 'ses_unregistered_X_31';
+  await expectPass('31.2a unregistered X delegates legitimately to executor: PASS', () => {
+    callID++;
+    return before31(
+      { tool: 'task', sessionID: sesX, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - x31', prompt: 'domain:implementation root cause known, unregistered X delegation' } }
+    );
+  });
+  await expectBlock('31.2b X write after its own task: X is now a root/Orchestrator, must delegate', () => {
+    callID++;
+    return before31(
+      { tool: 'write', sessionID: sesX, callID: 'call_' + callID, args: { filePath: 'src/app-31x.js', content: 'x' } },
+      { args: { filePath: 'src/app-31x.js', content: 'x' } }
+    );
+  }, 'Delegate instead of using write directly');
+
+  const sesY = 'ses_unregistered_Y_31';
+  await expectPass('31.2c second unregistered Y delegates: must not disarm X', () => {
+    callID++;
+    return before31(
+      { tool: 'task', sessionID: sesY, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - y31', prompt: 'domain:implementation root cause known, unregistered Y delegation' } }
+    );
+  });
+  // THE RED (:1204 hijack): pre-fix, Y's task steals the slot from X — X
+  // is left uncovered by check 2.5, crystallizes the executor residue and
+  // write passes with the executor profile.
+  await expectBlock('31.2d X write STILL blocked after Y took the hijack path', () => {
+    callID++;
+    return before31(
+      { tool: 'write', sessionID: sesX, callID: 'call_' + callID, args: { filePath: 'src/app-31x2.js', content: 'x' } },
+      { args: { filePath: 'src/app-31x2.js', content: 'x' } }
+    );
+  }, 'Delegate instead of using write directly');
 }
 
 console.log(`\n=== RESULTS: ${pass} passed, ${fail} failed out of ${pass+fail} tests ===\n`);
