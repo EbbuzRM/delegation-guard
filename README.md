@@ -6,7 +6,7 @@ Deterministic security middleware for [OpenCode](https://opencode.ai/) multi-age
 
 Also serves as a workaround for several OpenCode bugs.
 
-> **What this is -- and what it is NOT.** Delegation Guard is a deterministic policy-enforcement layer. It is **not** a sandbox, credential store, or complete secret scanner. Post-execution redaction (via `tool.execute.after`) cannot undo a tool action that already ran. Trusted agents -- those with `canDelegateTo: ["*"]`, currently `executor` and `spiker` -- are exempt from output scanning by design. The guard's own source, configuration, and test files are excluded from scanning because they contain textual pattern examples; treat them as untrusted input. See [SECURITY.md](docs/SECURITY.md) for full caveats.
+> **What this is -- and what it is NOT.** Delegation Guard is a deterministic policy-enforcement layer. It is **not** a sandbox, credential store, or complete secret scanner. Post-execution redaction (via `tool.execute.after`) cannot undo a tool action that already ran. Only agents with explicit `trustedForSecrets: true` -- currently `executor` and `spiker` -- are exempt from output scanning. The guard's own source, configuration, test files, and the scoped `.planning/BACKLOG.md` are excluded because they contain textual pattern examples; treat them as untrusted input. See [SECURITY.md](docs/SECURITY.md) for full caveats.
 
 | Without the guard | With Delegation Guard |
 |---|---|
@@ -22,7 +22,7 @@ Also serves as a workaround for several OpenCode bugs.
 
 1. **Prerequisites:** Node.js (any recent version supporting ES module `import`) and [OpenCode](https://opencode.ai/) with plugin support enabled.
 2. Follow [Installation from source](#installation-from-source) for the complete setup.
-3. From the repository, run `node test-harness2.mjs` to verify the guard in isolation (no OpenCode required). Expected result: 21 suites, 92 assertions, all passing.
+3. From the repository, run `node test-harness2.mjs` to verify the guard in isolation (no OpenCode required). Expected result: all assertions pass and the process exits with status `0`.
 4. Restart OpenCode after installation. The guard is live.
 
 ## What it protects
@@ -191,7 +191,7 @@ The same block applies to `grep`, `glob`, `edit`, `write`, and `bash` commands t
 
 ### Audit event
 
-Every blocked call is written as a JSONL line to `.planning/audit/audit-YYYY-MM-DD.jsonl`:
+Every blocked call is written as a JSONL line to the project's `.planning/audit/audit-YYYY-MM-DD.jsonl` (using the worktree when OpenCode reports a plugin-local directory):
 
 ```json
 {"timestamp":"2026-09-09T14:23:07.123+02:00","sessionId":"ses_abc123","eventType":"denied","agent":"executor","action":"blocked","details":{"check":"sensitive_file","error":"❌ SENSITIVE FILE: sensitive file access blocked for agent \"executor\". Tool: read, File: .env, Pattern: env_files, Severity: critical","filePath":".env","tool":"read"}}

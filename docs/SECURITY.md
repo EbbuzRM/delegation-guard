@@ -19,6 +19,8 @@ Include affected commit/version, reproduction steps, impact, and safe remediatio
 - Output scanning is skipped only for agents with explicit `trustedForSecrets: true` in `guard-config.json` — currently `executor` and `spiker` — because they legitimately handle secrets during env setup and commits. Trust is explicit per-agent config, never derived from `canDelegateTo`.
 - The guard blocks configured sensitive paths, but alternate encodings, generated commands, unsupported tools, and external processes may fall outside coverage.
 - Audit persistence failures do not block guard decisions.
+- Audit JSONL is project-scoped. If OpenCode supplies an unreliable plugin-local `directory`, the worktree is used; the plugin directory is only the final fallback.
+- An unregistered session that calls `task` is retained as a root to prevent orchestrator identity loss. If a real child's `session.created` event were lost, this can conservatively classify it as a root until deletion/restart and block its direct mutative tools. This fail-closed false positive is accepted; no event loss was observed in the recorded runtime probes.
 
 ## Invarianti
 
@@ -26,5 +28,6 @@ Include affected commit/version, reproduction steps, impact, and safe remediatio
 - The sessionID→agent registry is the primary identity source (the `agent` field is absent by design in `tool.execute.*` events).
 - Fallback safety-net: bash, webfetch, and sub-delegation are fail-closed; routing is fail-operational.
 - Secret-scan trust is explicit: only `trustedForSecrets: true` in `guard-config.json` disables output redaction (currently `executor` and `spiker`); it is never derived from `canDelegateTo`, and the fallback safety-net never sets it (fail-closed). Pinned by test suite section 27.
+- The identity bridge is armed only after every Guard task validation succeeds. Guard-rejected tasks cannot overwrite bridge identity, refresh its TTL, or clear a successful sibling's pending conflict gate (pinned by sections 29, 30, 32, and 34).
 
 Use least-privilege profiles, keep credentials outside worktrees, review audit logs, and validate configuration changes before deployment.

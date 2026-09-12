@@ -461,10 +461,21 @@ const SECRET_SCAN_EXCLUDED_FILES = [
   'test-harness2.mjs'
 ]
 
-function isSecretScanExcluded(filePath) {
+function isSecretScanExcluded(filePath, projectRoot) {
   if (!filePath || typeof filePath !== 'string') return false
   const normalized = filePath.replace(/\\/g, '/').toLowerCase()
-  return SECRET_SCAN_EXCLUDED_FILES.some(name => normalized === name || normalized.endsWith('/' + name))
+  if (SECRET_SCAN_EXCLUDED_FILES.some(name => normalized === name || normalized.endsWith('/' + name))) {
+    return true
+  }
+
+  // Only the current project's orchestration backlog is exempt. A suffix
+  // match would also exempt nested/.planning/BACKLOG.md and create a generic
+  // redaction bypass for agent-controlled subdirectories.
+  if (normalized === '.planning/backlog.md') return true
+  if (!projectRoot || typeof projectRoot !== 'string') return false
+  const resolvedFile = path.resolve(projectRoot, filePath).replace(/\\/g, '/').toLowerCase()
+  const projectBacklog = path.resolve(projectRoot, '.planning', 'BACKLOG.md').replace(/\\/g, '/').toLowerCase()
+  return resolvedFile === projectBacklog
 }
 
 /**
@@ -547,14 +558,12 @@ const workflowRules = {
 
 /**
  * Extracts the task delegation target agent from the hook arguments.
- * VER-LOW-02 (2026-09-11): the arming block read both sources
+ * VER-LOW-02 (2026-09-11): the pre-validation block read both sources
  * (output?.args?.subagent_type || input.args?.subagent_type) while the task
  * handler read ONLY output.args — a delegation carrying subagent_type in
- * input.args alone armed the identity bridge and then hit the handler's
- * early return with NO validation and NO rollback (TTL-bounded residue in
- * pendingAgentTypes + currentActiveAgent). Single shared extractor: both
- * sites now resolve the SAME value, so a delegation is either validated
- * and rolled back on failure, or never armed at all (both sources absent).
+ * input.args alone entered a different path than the handler. A single shared
+ * extractor makes pre-validation and full validation resolve the SAME value;
+ * radical REV-01 then arms only after successful validation.
  * @param {object} input - hook input ({ tool, sessionID, callID, args? })
  * @param {object} output - hook output ({ args? })
  * @returns {string|undefined} the subagent_type, if any
@@ -878,14 +887,6 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
   const rootSessions = new Set();
   let orchestratorSessionID = null;
   let currentActiveAgentTimestamp = 0;  // timestamp of last set, 0 = never set
-  // VER-LOW-01 (2026-09-11): callID of the task call that LAST CHANGED the
-  // value of currentActiveAgent (null = no owner). The task-handler rollback
-  // must not clobber the bridge of a legitimate sibling: under a same-type
-  // swarm (executor×2) a blocked delegation matches the bare
-  // `currentActiveAgent === targetAgent` check even though the bridge was
-  // armed by a DIFFERENT (still in-flight) call — the ownership guard below
-  // rolls back only the call that actually changed the value.
-  let bridgeArmedByCallID = null;
   const CURRENT_ACTIVE_AGENT_TTL_MS = 300000; // 5 min: freshness window for currentActiveAgent (fix 2026-07-23)
 
   /**
@@ -899,7 +900,6 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
       pendingAgentTypes.delete(currentActiveAgent);
       currentActiveAgent = null;
       currentActiveAgentTimestamp = 0;
-      bridgeArmedByCallID = null;  // owner reset with the value it armed (VER-LOW-01)
       return null;
     }
     return currentActiveAgent;
@@ -910,6 +910,17 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
     for (const [agentType, ts] of pendingAgentTypes.entries()) {
       if (now - ts > PENDING_TTL_MS) pendingAgentTypes.delete(agentType);
     }
+  }
+
+  // Radical REV-01 (2026-09-12): called only after every Guard validation has
+  // passed. Rejected task calls never mutate pending or bridge state, so no
+  // rollback/ownership machinery is needed. No await occurs between the
+  // conflict gate and this success arm, preserving atomic hook ordering.
+  function armIdentityBridge(targetAgent) {
+    const now = Date.now();
+    pendingAgentTypes.set(targetAgent, now);
+    currentActiveAgent = targetAgent;
+    currentActiveAgentTimestamp = now;
   }
 
   // NOTE: global delegation sequence intentionally removed. Each session keeps
@@ -934,6 +945,12 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
    * @type {Record<string, AgentProfile>}
    */
   const agentProfiles = loadAgentProfiles(directory)
+  const auditProjectRoot = isReliableProjectRoot(directory)
+    ? directory
+    : (isReliableProjectRoot(worktree) ? worktree : __dirname)
+  const auditLogDir = path.join(auditProjectRoot, '.planning', 'audit')
+  const persistProjectAuditEvent = (sessionId, eventType, agent, action, details = {}) =>
+    persistAuditEvent(auditLogDir, auditProjectRoot, sessionId, eventType, agent, action, details)
 
   // ============================================
   // HELPERS
@@ -951,7 +968,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
       checkFn();
     } catch (error) {
       runtimeLog(`blocked: sessionID=${sessionID}, agent=${agent || 'unknown'}, check=${checkName}, reason=${error.message}`)
-      persistAuditEvent(sessionID, 'denied', agent || 'unknown', 'blocked', {
+      persistProjectAuditEvent(sessionID, 'denied', agent || 'unknown', 'blocked', {
         check: checkName,
         error: error.message,
         ...details
@@ -1133,7 +1150,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
       // a heuristic "looks like an OpenCode native tool or not".
       if (!KNOWN_NATIVE_TOOLS.has(input.tool)) {
         runtimeLog(`🔍 MCP TOOL OBSERVED (not enforced): tool="${input.tool}", sessionID=${sessionID}, agent=${subagentType || (isOrchestrator ? 'orchestrator' : 'unknown')}`);
-        persistAuditEvent(sessionID, 'mcp_tool_usage', subagentType || (isOrchestrator ? 'orchestrator' : 'unknown'), 'observed', {
+        persistProjectAuditEvent(sessionID, 'mcp_tool_usage', subagentType || (isOrchestrator ? 'orchestrator' : 'unknown'), 'observed', {
           tool: input.tool
         });
       }
@@ -1182,9 +1199,9 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
       // identity (no agent field — see packages/plugin/src/index.ts). The
       // sessionID→agent registry (event session.created) is the primary
       // identity source; this bridge is the fallback.
-      // This bridge must be written ONLY after the conductor-rules gate:
-      // a blocked task must not leave pending/identity residue that
-      // contaminate the next retry.
+      // Pre-validation is read-only: enforce the parallel-type conflict and
+      // preserve root-session classification, but arm no identity here.
+      // Success-only arming happens at the end of the task handler.
       if (input.tool === 'task') {
         const targetAgent = extractTargetAgent(input, output);
         if (targetAgent) {
@@ -1205,25 +1222,16 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
             }, { targetAgent, otherPendingTypes })
           }
 
-          pendingAgentTypes.set(targetAgent, Date.now());
-          // VER-LOW-01: ownership is taken ONLY when this call CHANGES the
-          // bridge value. A same-type swarm delegation (executor×2) re-arms
-          // the same value: the second call must NOT steal ownership of the
-          // bridge legitimately armed by the first in-flight call, or a
-          // routing block on the second would clobber the first's bridge in
-          // the task-handler catch (ownership guard there matches
-          // bridgeArmedByCallID === input.callID).
-          if (currentActiveAgent !== targetAgent) {
-            bridgeArmedByCallID = input.callID;
-          }
-          currentActiveAgent = targetAgent;
-          currentActiveAgentTimestamp = Date.now();
-
           // Updates Orchestrator reference for non-crystallized sessions
           // and not already confirmed as children by the registry.
           // REV-02: an unregistered session calling task joins rootSessions
           // PERMANENTLY (before, it stole the single slot from the previous
           // holder) — its direct tools stay blocked by check 2.5, fail-closed.
+          // Accepted caveat (VER-R02-02): if a real child's session.created
+          // event were lost and its first tool were task, it would be
+          // classified as a root until session.deleted/plugin restart. This
+          // has not been observed and intentionally fails closed rather than
+          // adding a timer that could demote a genuine root.
           const callerState = sessionState.get(sessionID);
           const isKnownChildSession = subagentRegistry.has(sessionID);
           if ((!callerState || !callerState.lastAgent) && !isKnownChildSession) {
@@ -1301,10 +1309,12 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
 
       if (input.tool === 'bash') {
         const command = input.args?.command || output?.args?.command || '';
-        // If the identity is the orchestrator (root), block bash
+        // True roots were already blocked by check 2.5. This branch handles
+        // the live unknown-identity case; the orchestrator value remains a
+        // defensive backstop for future identity-ordering drift.
         if (!subagentType || subagentType === 'orchestrator') {
-          auditedCheck(sessionID, 'orchestrator', 'bash_block', () => {
-            throw new Error(`❌ BASH: The Orchestrator cannot use the shell. Delegate to a subagent.`);
+          auditedCheck(sessionID, 'unknown', 'bash_block', () => {
+            throw new Error(`❌ BASH: unknown identity — the session is not registered as a subagent. Delegate instead.`);
           }, { command });
           return;
         }
@@ -1380,7 +1390,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
         // No error → persist any allowed entries
         const newEntries = state.webfetchAudit.slice(beforeAuditLen)
         for (const entry of newEntries) {
-          persistAuditEvent(sessionID, 'webfetch', subagentType || 'unknown', entry.allowed ? 'allowed' : 'blocked', {
+          persistProjectAuditEvent(sessionID, 'webfetch', subagentType || 'unknown', entry.allowed ? 'allowed' : 'blocked', {
             url,
             reason: entry.reason,
             prompt: entry.prompt
@@ -1402,8 +1412,8 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
           return
         }
         if (isOrchestrator || !subagentType || subagentType === 'orchestrator') {
-          auditedCheck(sessionID, 'orchestrator', 'edit_block', () => {
-            throw new Error(`❌ EDIT: The Orchestrator cannot modify files. Delegate to a subagent.`)
+          auditedCheck(sessionID, 'unknown', 'edit_block', () => {
+            throw new Error(`❌ EDIT: unknown identity — the session is not registered as a subagent. Delegate instead.`)
           }, { filePath })
           return
         }
@@ -1422,17 +1432,18 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
         // M1 (2026-09-10, REV-01): the only real mutative hole at unknown
         // identity — write fell through to checkWritePath("unknown", ...) and
         // passed. bash/edit/rm were already blocked downstream; now write is
-        // fail-closed too, specular to the edit pattern below. For a true
-        // Orchestrator session check 2.5 (orchestrator_direct_tool) already
-        // blocks write BEFORE this line, so the throw below is effectively for
-        // the unknown-identity case — kept as-is (harmless redundancy).
+        // fail-closed too, specular to the edit pattern below. Proof of the
+        // live term: when rootSessions/the legacy slot identifies a true root,
+        // check 2.5 throws before this dispatcher; when neither identifies a
+        // root, isOrchestrator can only be true through `!caller &&
+        // !state.lastAgent`, which also means `!subagentType`. Therefore
+        // `!subagentType` is the operative case; the other terms remain only
+        // defensive backstops against future identity-ordering drift.
         // VER-M1-01: audit label unified to 'unknown' (was 'orchestrator') —
         // matches the webfetch_block label for unknown identity; the audit
         // agent argument is observability only, the thrown message is unchanged.
-        // REV-01 (2026-09-11): this fail-closed throw only holds if a BLOCKED
-        // delegation leaves no identity residue — the task-handler catch below
-        // must roll back currentActiveAgent (not just pendingAgentTypes), or an
-        // unregistered session resolves the rejected target and skips this throw.
+        // Radical REV-01 (2026-09-12): rejected delegations never arm the
+        // identity bridge, so they cannot skip this fail-closed branch.
         if (isOrchestrator || !subagentType || subagentType === 'orchestrator') {
           auditedCheck(sessionID, 'unknown', 'write_block', () => {
             throw new Error(`❌ WRITE: unknown identity — the session is not registered as a subagent. Delegate instead.`)
@@ -1459,12 +1470,11 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
 
       // ---- TASK DELEGATION (case B) ----
       if (input.tool === 'task') {
-        // VER-LOW-02: SAME extractor as the arming block above (shared
+        // VER-LOW-02: SAME extractor as the pre-validation block above (shared
         // helper) — a delegation with subagent_type only in input.args now
-        // enters the full validation flow instead of early-returning with
-        // the bridge armed and no rollback path. The early return below
-        // fires only when BOTH sources lack subagent_type, in which case the
-        // arming block never armed anything (its own `if (targetAgent)`).
+        // enters the full validation flow. The early return below fires only
+        // when BOTH sources lack subagent_type; success-only arming therefore
+        // cannot run for a schema-incomplete task.
         const targetAgent = extractTargetAgent(input, output)
         runtimeLog(`TASK HANDLER START: tool=${input.tool}, targetAgent=${targetAgent}`)
         try {
@@ -1488,10 +1498,8 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
             // OpenCode schema (so the delegation IS executed) but does not
             // correspond to any configured agent — must be blocked, not
             // left to pass silently.
-            // NOTE (REV-04): no pendingAgentTypes.delete here — this throw is
-            // caught by the task-handler catch below, which performs the full
-            // symmetric rollback (pending + identity bridge). A delete here
-            // would be redundant.
+            // Radical REV-01: no pending/bridge cleanup is needed here because
+            // identity state is armed only after all validations succeed.
             auditedCheck(sessionID, targetAgent, 'unknown_agent', () => {
               throw new Error(
                 `❌ ROUTING: subagent_type "${targetAgent}" does not exist in guard-config.json — delegation forbidden.\n` +
@@ -1611,6 +1619,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
             // check state.lastAgent). The caller's identity must go
             // set ONLY during crystallization (above), never from here.
             sessionState.set(sessionID, state)
+            armIdentityBridge(targetAgent)
             return
           }
 
@@ -1633,47 +1642,14 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
             state.delegationSequence.shift(); // removes the oldest
           }
           sessionState.set(sessionID, state);
-          persistAuditEvent(sessionID, 'delegation', targetAgent, 'executed', {
+          persistProjectAuditEvent(sessionID, 'delegation', targetAgent, 'executed', {
             fullTextPreview: fullText.substring(0, 200)
           })
+          armIdentityBridge(targetAgent)
         } catch (taskError) {
-          // Rollback: the subagent will never be created (the check failed before
-          // creation), so neither pendingAgentTypes NOR the identity bridge may keep
-          // the rejected target. Leaving currentActiveAgent armed grants the rejected
-          // agent's profile to the NEXT unregistered session (write/bash/edit pass:
-          // validatePathZone does not consult agentProfiles) and crystallizes it
-          // permanently into state.lastAgent (identity lock block) — fail-closed
-          // inverted to fail-open by the block itself.
-          //
-          // VER-LOW-01 (2026-09-11): the bridge rollback is guarded by
-          // OWNERSHIP, not just by value. Under a same-type swarm (executor×2,
-          // legitimate fan-out — the parallel_identity_conflict gate filters
-          // t !== targetAgent and lets same-type through) a blocked delegation
-          // has `currentActiveAgent === targetAgent` true even when the bridge
-          // was armed by a DIFFERENT in-flight sibling call: rolling back on
-          // the value alone would clobber the legitimate sibling's bridge
-          // (degrading it to unknown identity). The double guard
-          // `currentActiveAgent === targetAgent && bridgeArmedByCallID === input.callID`
-          // rolls back ONLY the call that took ownership (the call that last
-          // CHANGED the bridge value — see the arming block). A blocked
-          // delegation that never changed the value leaves the sibling's
-          // bridge intact; a blocked delegation that DID arm (single
-          // delegation, or first-of-swarm) rolls back fully (pins 29.3/29.4).
-          //
-          // pendingAgentTypes.delete stays UNCONDITIONAL (documented minor
-          // side-effect): it only disarms the defensive
-          // parallel_identity_conflict gate for the sibling type — never
-          // observed necessary (registry is the primary identity source,
-          // P2.7-8/P2.9) and re-armed by the next delegation of that type.
-          if (targetAgent) {
-            pendingAgentTypes.delete(targetAgent);
-            if (currentActiveAgent === targetAgent && bridgeArmedByCallID === input.callID) {
-              currentActiveAgent = null;
-              currentActiveAgentTimestamp = 0;
-              bridgeArmedByCallID = null;
-            }
-            runtimeLog(`[ROLLBACK] cleared pending+bridge for "${targetAgent}" after task check failure: ${taskError.message}`);
-          }
+          // Success-only arming means a Guard-rejected task changed neither
+          // pendingAgentTypes nor the identity bridge. Preserve all prior
+          // sibling state and propagate the original enforcement error.
           throw taskError;  // Re-throw to maintain the blocking behavior
         }
       }
@@ -1700,7 +1676,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
 
         const auditLog = state.secretDetectionAudit || (state.secretDetectionAudit = [])
         const filePath = output?.args?.filePath || output?.args?.pattern || input.args?.filePath || input.args?.pattern || input.args?.path || ''
-        checkSecretsInOutput(output?.output || output?.metadata || output, state.lastAgent, profile, auditLog, filePath)
+        checkSecretsInOutput(output?.output || output?.metadata || output, state.lastAgent, profile, auditLog, filePath, auditProjectRoot)
       } catch (e) {
         // Hook after cannot block originally, but by modifying the output object by reference
         // we can actively redact secrets before they return to OpenCode.
@@ -1722,7 +1698,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
         const sessionID = input.sessionID || 'default'
         const agent = sessionState.get(sessionID)?.lastAgent || 'unknown'
         runtimeLog(`🚨 SECRET DETECTED (post-exec): sessionID=${sessionID}, agent=${agent}, reason=${e.message}`)
-        persistAuditEvent(sessionID, 'denied', agent, 'blocked', {
+        persistProjectAuditEvent(sessionID, 'denied', agent, 'blocked', {
           check: 'secret_detection_after',
           error: e.message
         })
@@ -1797,7 +1773,9 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
       // The array already has a cap of 20 with FIFO eviction (see below), so
       // memory hygiene cleanup is guaranteed without needing this reset.
       if (event?.type === 'session.deleted') {
-        const sessionID = event?.sessionID
+        // Current OpenCode schema stores the deleted session under info.id.
+        // Keep the older fields as compatibility fallbacks for older hosts.
+        const sessionID = event?.properties?.info?.id || event?.properties?.sessionID || event?.sessionID
         if (sessionID) {
           subagentRegistry.delete(sessionID);
           // REV-02: prune the root session from the Set (TUI /new, session
@@ -1854,7 +1832,8 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
 // ============================================
 // Writes audit events in JSONL format (one JSON event per line) in
 // `audit-YYYY-MM-DD.jsonl` inside the configured directory. Production default:
-// `.planning/audit` (relative to `__dirname`).
+// `<project>/.planning/audit`; if `directory` is unreliable, the factory uses
+// the worktree, then falls back to the plugin directory only as a last resort.
 //
 // Event schema:
 //   { timestamp, sessionId, eventType, agent, action, details }
@@ -1867,11 +1846,9 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
 // with prefix `[GUARD-AUDIT-ERROR]`). The guard must never block on
 // I/O problems on the audit log.
 
-/** @type {string} */
-let currentAuditLogDir = path.join(__dirname, '.planning', 'audit')
-
 /**
  * Manages the persistence of incidents and lessons learned when an event is 'denied'.
+ * @param {string} projectDirectory
  * @param {string} agent 
  * @param {Record<string, any>} details 
  */
@@ -1891,25 +1868,25 @@ function sanitizeForMarkdownLog(value) {
   return text.replace(/[\r\n]+/g, ' ⏎ ')
 }
 
-function handleDeniedEvent(agent, details) {
+function handleDeniedEvent(projectDirectory, agent, details) {
   try {
-    if (!_projectDirectory) {
-      runtimeLog(`handleDeniedEvent: _projectDirectory not set. Skipping persistence.`);
+    if (!projectDirectory) {
+      runtimeLog(`handleDeniedEvent: projectDirectory not set. Skipping persistence.`);
       return;
     }
-    if (_projectDirectory.endsWith(path.sep + '.opencode') || _projectDirectory.includes(path.sep + '.opencode' + path.sep)) {
-        runtimeLog(`handleDeniedEvent: _projectDirectory is inside .opencode (${_projectDirectory}). Skipping persistence.`);
+    if (projectDirectory.endsWith(path.sep + '.opencode') || projectDirectory.includes(path.sep + '.opencode' + path.sep)) {
+        runtimeLog(`handleDeniedEvent: projectDirectory is inside .opencode (${projectDirectory}). Skipping persistence.`);
         return;
     }
-    const metricsPath = path.resolve(_projectDirectory, '.opencode', 'metrics_count.json');
-    const incidentsPath = path.resolve(_projectDirectory, '.planning', 'INCIDENTS.md');
+    const metricsPath = path.resolve(projectDirectory, '.opencode', 'metrics_count.json');
+    const incidentsPath = path.resolve(projectDirectory, '.planning', 'INCIDENTS.md');
     // FIX (2026-09-11, LESSONS containment): lessons used to be written to
     // ~/.config/opencode/LESSONS.md — OUTSIDE the project containment, so
     // denied phrases from one project leaked into a cross-project file.
     // Now co-located with INCIDENTS.md in the project's .planning/ dir
-    // (same _projectDirectory mechanism, same append semantics). The old
+    // (same project-root mechanism, same append semantics). The old
     // homedir file, if present, is user data and is NOT touched/migrated.
-    const lessonsPath = path.resolve(_projectDirectory, '.planning', 'LESSONS.md');
+    const lessonsPath = path.resolve(projectDirectory, '.planning', 'LESSONS.md');
     const metricsDir = path.dirname(metricsPath);
     const planningDir = path.dirname(incidentsPath);
     const lessonsDir = path.dirname(lessonsPath);
@@ -1972,23 +1949,25 @@ function handleDeniedEvent(agent, details) {
  * - Encoding UTF-8, line separator `\n`.
  * - Write errors are logged in `console.error` and NOT propagated.
  *
+ * @param {string} auditLogDir - Per-instance audit directory
+ * @param {string} projectDirectory - Per-instance project root for denied-event files
  * @param {string} sessionId - OpenCode session ID
  * @param {string} eventType - Event type ('secret'|'sensitive'|'webfetch'|'delegation'|'denied')
  * @param {string|null} agent - Agent that generated the event (or null)
  * @param {string} action - Action ('redacted'|'allowed'|'blocked'|'executed')
  * @param {Record<string, any>} [details] - Optional type-specific details
  */
-function persistAuditEvent(sessionId, eventType, agent, action, details = {}) {
+function persistAuditEvent(auditLogDir, projectDirectory, sessionId, eventType, agent, action, details = {}) {
   try {
-    if (!existsSync(currentAuditLogDir)) {
-      mkdirSync(currentAuditLogDir, { recursive: true })
+    if (!existsSync(auditLogDir)) {
+      mkdirSync(auditLogDir, { recursive: true })
     }
     const now = new Date()
     const pad = (/** @type {number} */ n) => n.toString().padStart(2, '0')
 
     const dateStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}` // YYYY-MM-DD local
     const filename = `audit-${dateStr}.jsonl`
-    const filepath = path.join(currentAuditLogDir, filename)
+    const filepath = path.join(auditLogDir, filename)
     const event = {
       timestamp: getLocalTimestamp(),
       sessionId: sessionId || 'unknown',
@@ -2000,7 +1979,7 @@ function persistAuditEvent(sessionId, eventType, agent, action, details = {}) {
     appendFileSync(filepath, JSON.stringify(event) + '\n', 'utf8')
 
     if (eventType === 'denied') {
-      handleDeniedEvent(agent || 'unknown', details);
+      handleDeniedEvent(projectDirectory, agent || 'unknown', details);
     }
   } catch (e) {
     // Write errors must NOT block the guard.
@@ -2384,9 +2363,10 @@ function checkTaskSubDelegation(caller, callerProfile, target, allProfiles) {
  * @param {any} profile - Agent profile (optional, but mandatory for fail-closed)
  * @param {any[]} [auditLog] - Optional array to push detection records into
  * @param {string} [filePath] - Path of the file read (if applicable), for exclusion of log/lessons of the Guard
+ * @param {string} [projectRoot] - Reliable project root used for project-scoped exclusions
  * @throws {Error} if profile is missing or if a secret is found
  */
-function checkSecretsInOutput(output, subagent, profile, auditLog, filePath) {
+function checkSecretsInOutput(output, subagent, profile, auditLog, filePath, projectRoot) {
   if (!output) return
   if (!profile) {
     throw new Error(`❌ GUARD: profile missing for checkSecretsInOutput (subagent: ${subagent})`)
@@ -2398,7 +2378,7 @@ function checkSecretsInOutput(output, subagent, profile, auditLog, filePath) {
   // trust decision. The M2 fallback never sets the flag → fail-closed.
   if (profile.trustedForSecrets === true) return
   // Guard log/lesson files → skip (path mentions, not real secrets)
-  if (isSecretScanExcluded(filePath)) return
+  if (isSecretScanExcluded(filePath, projectRoot)) return
 
   const text = typeof output === 'string' ? output : JSON.stringify(output)
   if (!text) return
@@ -2546,17 +2526,18 @@ function validatePathZone(agent, filePath, opType) {
 
 /**
  * A project root candidate is "reliable" if it is not empty and does not point
- * into `.opencode` or `plugins` — the same two contexts where OpenCode is
- * known to pass the wrong directory (see comment in validatePathZone).
+ * into `.opencode` or OpenCode's plugin directory — the contexts where OpenCode
+ * is known to pass the wrong directory (see comment in validatePathZone).
+ * Ordinary project paths such as `repos/plugins/app` remain valid.
  * @param {string} dir
  * @returns {boolean}
  */
 function isReliableProjectRoot(dir) {
   if (!dir) return false
-  return !dir.endsWith(path.sep + '.opencode') &&
-    !dir.includes(path.sep + '.opencode' + path.sep) &&
-    !dir.endsWith(path.sep + 'plugins') &&
-    !dir.includes(path.sep + 'plugins' + path.sep)
+  const normalized = path.resolve(dir).replace(/\\/g, '/').toLowerCase()
+  return !normalized.endsWith('/.opencode') &&
+    !normalized.includes('/.opencode/') &&
+    !/(?:^|\/)\.config\/opencode\/plugins(?:\/|$)/.test(normalized)
 }
 
 /**

@@ -5,3 +5,5 @@ node_modules/
 sync-from-opencode.ps1
 setup-autostart.ps1
 .opencode/
+.obsidian-second-brain.json
+graphify-out/

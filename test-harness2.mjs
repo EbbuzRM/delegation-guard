@@ -1,10 +1,13 @@
 import { DelegationGuard } from './delegation-guard.js';
-import { readFileSync, existsSync, rmSync, mkdirSync, mkdtempSync, copyFileSync } from 'node:fs';
+import { readFileSync, existsSync, rmSync, mkdirSync, mkdtempSync, copyFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL, fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+import { reportHarnessResults } from './test-harness-results.mjs';
 
 const mockClient = { tui: { showToast: async () => {} } };
+const originalCwd = process.cwd();
 const testRoot = mkdtempSync(path.join(os.tmpdir(), 'delegation-guard-harness-'));
 process.chdir(testRoot);
 function projectRoot() {
@@ -687,6 +690,24 @@ console.log('--- 14. SECRET SCAN: false positive when reading the Guard source f
     }
   });
 
+  await expectPass('reading .planning/BACKLOG.md is NOT redacted (scoped policy documentation exclusion)', async () => {
+    const output = { args: { filePath: '.planning\\BACKLOG.md' }, output: 'planned Windows probe: .ssh/id_rsa' };
+    await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
+    if (output.output.includes('REDACTED')) throw new Error(`expected intact backlog, found: ${output.output}`);
+  });
+
+  await expectPass('reading docs/BACKLOG.md remains subject to secret redaction', async () => {
+    const output = { args: { filePath: 'C:\\project\\docs\\BACKLOG.md' }, output: 'private key: .ssh/id_rsa' };
+    await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
+    if (!output.output.includes('REDACTED')) throw new Error(`expected REDACTED outside .planning, found: ${output.output}`);
+  });
+
+  await expectPass('nested .planning/BACKLOG.md remains subject to secret redaction', async () => {
+    const output = { args: { filePath: 'nested\\.planning\\BACKLOG.md' }, output: 'private key: .ssh/id_rsa' };
+    await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
+    if (!output.output.includes('REDACTED')) throw new Error(`expected REDACTED for nested backlog, found: ${output.output}`);
+  });
+
   await expectPass('reading a NON-excluded file with a real secret still gets redacted (no regression)', async () => {
     const output = { args: { filePath: 'C:\\Users\\test\\project\\some-other-file.js' }, output: 'private key: .ssh/id_rsa' };
     await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
@@ -702,33 +723,38 @@ console.log('--- 15. PATH TRAVERSAL BYPASS: worktree fallback when directory is 
   // OpenCode bug), the old code skipped the ENTIRE containment check —
   // no other check stops an absolute path outside the project. Now it uses `worktree`
   // as the fallback root before giving up with a total skip.
-  const guardTraversal = await DelegationGuard({
-    project: { id: 'test-project-traversal' }, client: mockClient, $: async () => {},
-    directory: 'C:\\Users\\test\\.opencode\\plugins', // unreliable on purpose
-    worktree: 'C:\\Users\\test\\real-project' // reliable fallback
-  });
-  const beforeTrav = guardTraversal['tool.execute.before'];
-  const eventTrav = guardTraversal['event'];
-  const subSessionTrav = 'ses_sub_traversal';
-  await eventTrav({ event: { type: 'session.created', properties: { sessionID: subSessionTrav, info: { agent: 'executor', parentID: 'ses_orch_traversal' } } } });
+  const traversalWorktree = mkdtempSync(path.join(os.tmpdir(), 'delegation-guard-traversal-'));
+  try {
+    const guardTraversal = await DelegationGuard({
+      project: { id: 'test-project-traversal' }, client: mockClient, $: async () => {},
+      directory: path.join(traversalWorktree, '.opencode', 'plugins'), // unreliable on purpose
+      worktree: traversalWorktree
+    });
+    const beforeTrav = guardTraversal['tool.execute.before'];
+    const eventTrav = guardTraversal['event'];
+    const subSessionTrav = 'ses_sub_traversal';
+    await eventTrav({ event: { type: 'session.created', properties: { sessionID: subSessionTrav, info: { agent: 'executor', parentID: 'ses_orch_traversal' } } } });
 
-  await expectBlock('write outside the fallback worktree gets blocked (was: no block)', () => {
-    callID++;
-    const filePath = 'C:\\Windows\\System32\\evil.txt';
-    return beforeTrav(
-      { tool: 'write', sessionID: subSessionTrav, callID: 'call_' + callID, args: { filePath, content: 'x' } },
-      { args: { filePath, content: 'x' } }
-    );
-  }, 'PATH OUT OF PROJECT');
+    await expectBlock('write outside the fallback worktree gets blocked (was: no block)', () => {
+      callID++;
+      const filePath = path.join(path.dirname(traversalWorktree), 'outside-traversal.txt');
+      return beforeTrav(
+        { tool: 'write', sessionID: subSessionTrav, callID: 'call_' + callID, args: { filePath, content: 'x' } },
+        { args: { filePath, content: 'x' } }
+      );
+    }, 'PATH OUT OF PROJECT');
 
-  await expectPass('write inside the fallback worktree stays allowed', () => {
-    callID++;
-    const filePath = 'C:\\Users\\test\\real-project\\src\\ok.txt';
-    return beforeTrav(
-      { tool: 'write', sessionID: subSessionTrav, callID: 'call_' + callID, args: { filePath, content: 'x' } },
-      { args: { filePath, content: 'x' } }
-    );
-  });
+    await expectPass('write inside the fallback worktree stays allowed', () => {
+      callID++;
+      const filePath = path.join(traversalWorktree, 'src', 'ok.txt');
+      return beforeTrav(
+        { tool: 'write', sessionID: subSessionTrav, callID: 'call_' + callID, args: { filePath, content: 'x' } },
+        { args: { filePath, content: 'x' } }
+      );
+    });
+  } finally {
+    rmSync(traversalWorktree, { recursive: true, force: true });
+  }
 }
 
 console.log('--- 16. INCIDENTS.md INJECTION: newline in an error must not forge fake entries ---');
@@ -821,6 +847,13 @@ console.log('--- 18. MAX_SESSIONS LRU: the Orchestrator is never evicted even ov
     { tool: 'skill', sessionID: orchSessionLru, callID: 'call_' + callID },
     { args: { name: 'conductor-rules' } }
   );
+  const secondRootLru = 'ses_orch_lru_second_root';
+  await eventLru({ event: { type: 'session.created', properties: { sessionID: secondRootLru, info: { agent: 'orchestrator' } } } });
+  callID++;
+  await beforeLru(
+    { tool: 'skill', sessionID: secondRootLru, callID: 'call_' + callID },
+    { args: { name: 'conductor-rules' } }
+  );
 
   // Fill the Map well beyond MAX_SESSIONS (100) with other harmless sessions —
   // registered as subagents (verifier) via the event hook, otherwise with no
@@ -841,6 +874,13 @@ console.log('--- 18. MAX_SESSIONS LRU: the Orchestrator is never evicted even ov
     return beforeLru(
       { tool: 'task', sessionID: orchSessionLru, callID: 'call_' + callID },
       { args: { subagent_type: 'executor', description: 'domain:implementation - test LRU', prompt: 'domain:implementation root cause known, test LRU' } }
+    );
+  });
+  await expectPass('the non-slot second root also survives LRU pressure with conductor-rules state intact', () => {
+    callID++;
+    return beforeLru(
+      { tool: 'task', sessionID: secondRootLru, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - multi-root LRU pin', prompt: 'domain:implementation root cause known, multi-root LRU pin' } }
     );
   });
 }
@@ -1543,8 +1583,8 @@ console.log('--- 29. Blocked delegation must not arm the identity bridge (REV-01
 // 30.1c scenario note (VER-LOW-01): the `parallel_identity_conflict` gate
 // (:1145) filters `t !== targetAgent`, so a same-type swarm (executor×2)
 // NEVER triggers it — the second delegation arms and only the routing check
-// inside the task-handler try can throw, exercising the catch rollback.
-console.log('--- 30. Same-type swarm rollback must not clobber the sibling bridge (VER-LOW-01) + unified targetAgent extraction (VER-LOW-02) ---');
+// inside the task-handler try can throw, exercising rejection before arming.
+console.log('--- 30. Rejected same-type task must not clobber the sibling bridge (VER-LOW-01) + unified targetAgent extraction (VER-LOW-02) ---');
 {
   const guard30 = await DelegationGuard({
     project: { id: 'test-project-residue-30' }, client: mockClient, $: async () => {},
@@ -1586,7 +1626,7 @@ console.log('--- 30. Same-type swarm rollback must not clobber the sibling bridg
   // Post-fix: the bridge owner (30.1a's callID) does not match 30.1b's, the
   // sibling bridge survives, identity resolves executor (bashAllowlist ["*"]).
   const bridge30 = 'ses_sub_swarm_sibling_30';
-  await expectPass('30.1c sibling bridge INTACT after same-type blocked rollback: unregistered session still resolves executor', () => {
+  await expectPass('30.1c sibling bridge INTACT after same-type rejection: unregistered session still resolves executor', () => {
     callID++;
     return before30(
       { tool: 'bash', sessionID: bridge30, callID: 'call_' + callID, args: { command: 'npm install' } },
@@ -1758,10 +1798,325 @@ console.log('--- 31. Multi-root: every root session stays Orchestrator (REV-02) 
       { args: { filePath: 'src/app-31x2.js', content: 'x' } }
     );
   }, 'Delegate instead of using write directly');
+
+  // Isolated instance avoids an unrelated active bridge from the preceding LRU
+  // scenario. Root B is deliberately the non-slot root, then deleted using the
+  // real OpenCode payload shape.
+  const guardDeleted31 = await DelegationGuard({
+    project: { id: 'test-project-deleted-root-31' }, client: mockClient, $: async () => {},
+    directory: projectRoot('deleted-root31'), worktree: projectRoot('deleted-root31')
+  });
+  const beforeDeleted31 = guardDeleted31['tool.execute.before'];
+  const eventDeleted31 = guardDeleted31['event'];
+  await eventDeleted31({ event: { type: 'session.created', properties: { sessionID: 'ses_slot_root_31', info: { id: 'ses_slot_root_31', agent: 'orchestrator' } } } });
+  const deletedRoot31 = 'ses_deleted_non_slot_root_31';
+  await eventDeleted31({ event: { type: 'session.created', properties: { sessionID: deletedRoot31, info: { id: deletedRoot31, agent: 'orchestrator' } } } });
+  await eventDeleted31({ event: { type: 'session.deleted', properties: { info: { id: deletedRoot31, agent: 'orchestrator' } } } });
+  await expectBlock('31.3 session.deleted uses properties.info.id and removes a non-slot root', () => {
+    callID++;
+    return beforeDeleted31(
+      { tool: 'bash', sessionID: deletedRoot31, callID: 'call_' + callID, args: { command: 'node --version' } },
+      { args: { command: 'node --version' } }
+    );
+  }, 'unknown identity');
 }
 
-console.log(`\n=== RESULTS: ${pass} passed, ${fail} failed out of ${pass+fail} tests ===\n`);
-if (failures.length) {
-  console.log('FAILURES:');
-  failures.forEach(f => console.log(' -', f));
+console.log('--- 32. Rejected different-type task never overwrites the previous bridge (VER-LOW-01b + radical REV-01) ---');
+{
+  const guard32 = await DelegationGuard({
+    project: { id: 'test-project-restore-bridge-32' }, client: mockClient, $: async () => {},
+    directory: projectRoot('restore-bridge32'), worktree: projectRoot('restore-bridge32')
+  });
+  const before32 = guard32['tool.execute.before'];
+  const event32 = guard32['event'];
+  const orch32 = 'ses_orch_restore_bridge_32';
+  await event32({ event: { type: 'session.created', properties: { sessionID: orch32, info: { agent: 'orchestrator' } } } });
+  await preloadConductorRules(guard32, orch32);
+
+  await expectPass('32.1 successful executor delegation arms the bridge', () => {
+    callID++;
+    return before32(
+      { tool: 'task', sessionID: orch32, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - bridge owner', prompt: 'domain:implementation implement the planned change' } }
+    );
+  });
+
+  // Production fast-release: the child registration clears executor from
+  // pendingAgentTypes, allowing a different target to enter the arming path.
+  await event32({ event: { type: 'session.created', properties: { sessionID: 'ses_executor_registered_32', info: { parentID: orch32, agent: 'executor' } } } });
+
+  await expectBlock('32.2 different-type verifier delegation is blocked before bridge arming', () => {
+    callID++;
+    return before32(
+      { tool: 'task', sessionID: orch32, callID: 'call_' + callID },
+      { args: { subagent_type: 'verifier', description: 'domain:implementation - wrong target', prompt: 'domain:implementation implement the planned change' } }
+    );
+  }, 'requires executor, not verifier');
+
+  // Radical REV-01: the rejected verifier never overwrites the prior executor.
+  await expectPass('32.3 previous executor bridge remains intact after different-type rejection', () => {
+    callID++;
+    return before32(
+      { tool: 'edit', sessionID: 'ses_unregistered_executor_sibling_32', callID: 'call_' + callID, args: { filePath: 'src/bridge-owner.js', oldString: 'a', newString: 'b' } },
+      { args: { filePath: 'src/bridge-owner.js', oldString: 'a', newString: 'b' } }
+    );
+  });
 }
+
+console.log('--- 34. Success-only identity bridge arming (radical REV-01) ---');
+{
+  const guard34 = await DelegationGuard({
+    project: { id: 'test-project-success-only-arming-34' }, client: mockClient, $: async () => {},
+    directory: projectRoot('success-only-arming34'), worktree: projectRoot('success-only-arming34')
+  });
+  const before34 = guard34['tool.execute.before'];
+  const event34 = guard34['event'];
+  const orch34 = 'ses_orch_success_only_34';
+  await event34({ event: { type: 'session.created', properties: { sessionID: orch34, info: { agent: 'orchestrator' } } } });
+  await preloadConductorRules(guard34, orch34);
+
+  callID++;
+  await before34(
+    { tool: 'task', sessionID: orch34, callID: 'call_' + callID },
+    { args: { subagent_type: 'executor', description: 'domain:implementation - pending owner', prompt: 'domain:implementation implement the planned change' } }
+  );
+  await expectBlock('34.1 rejected same-type task must not delete the successful sibling pending gate', async () => {
+    callID++;
+    await expectBlock('34.1 setup: same-type executor rejected by documentation routing', () => before34(
+      { tool: 'task', sessionID: orch34, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'write README.md documentation', prompt: 'write README.md documentation only' } }
+    ), 'Documentation task detected');
+    callID++;
+    return before34(
+      { tool: 'task', sessionID: orch34, callID: 'call_' + callID },
+      { args: { subagent_type: 'verifier', description: 'domain:verification - pending conflict', prompt: 'domain:verification verify the planned change' } }
+    );
+  }, 'PARALLEL CONFLICT');
+  await event34({ event: { type: 'session.created', properties: { sessionID: 'ses_executor_fast_release_34', info: { parentID: orch34, agent: 'executor' } } } });
+  await expectPass('34.2 fast-release still unlocks a different-type delegation', () => {
+    callID++;
+    return before34(
+      { tool: 'task', sessionID: orch34, callID: 'call_' + callID },
+      { args: { subagent_type: 'verifier', description: 'domain:verification - after release', prompt: 'domain:verification verify the planned change' } }
+    );
+  });
+}
+
+{
+  const realDateNow = Date.now;
+  let fakeNow = 1_700_000_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const guardTtl34 = await DelegationGuard({
+      project: { id: 'test-project-rejected-ttl-34' }, client: mockClient, $: async () => {},
+      directory: projectRoot('rejected-ttl34'), worktree: projectRoot('rejected-ttl34')
+    });
+    const beforeTtl34 = guardTtl34['tool.execute.before'];
+    const eventTtl34 = guardTtl34['event'];
+    const orchTtl34 = 'ses_orch_rejected_ttl_34';
+    await eventTtl34({ event: { type: 'session.created', properties: { sessionID: orchTtl34, info: { agent: 'orchestrator' } } } });
+    await preloadConductorRules(guardTtl34, orchTtl34);
+    callID++;
+    await beforeTtl34(
+      { tool: 'task', sessionID: orchTtl34, callID: 'call_' + callID },
+      { args: { subagent_type: 'executor', description: 'domain:implementation - ttl owner', prompt: 'domain:implementation implement the planned change' } }
+    );
+    fakeNow += 299_000;
+    await expectBlock('34.3 setup: rejected same-type task near TTL boundary', () => {
+      callID++;
+      return beforeTtl34(
+        { tool: 'task', sessionID: orchTtl34, callID: 'call_' + callID },
+        { args: { subagent_type: 'executor', description: 'write README.md documentation', prompt: 'write README.md documentation only' } }
+      );
+    }, 'Documentation task detected');
+    fakeNow += 2_000;
+    await expectBlock('34.4 rejected task does not refresh bridge TTL', () => {
+      callID++;
+      return beforeTtl34(
+        { tool: 'bash', sessionID: 'ses_unregistered_expired_34', callID: 'call_' + callID, args: { command: 'npm install' } },
+        { args: { command: 'npm install' } }
+      );
+    });
+
+    fakeNow = 1_800_000_000_000;
+    const guardRefresh34 = await DelegationGuard({
+      project: { id: 'test-project-success-ttl-34' }, client: mockClient, $: async () => {},
+      directory: projectRoot('success-ttl34'), worktree: projectRoot('success-ttl34')
+    });
+    const beforeRefresh34 = guardRefresh34['tool.execute.before'];
+    const eventRefresh34 = guardRefresh34['event'];
+    const orchRefresh34 = 'ses_orch_success_ttl_34';
+    await eventRefresh34({ event: { type: 'session.created', properties: { sessionID: orchRefresh34, info: { agent: 'orchestrator' } } } });
+    await preloadConductorRules(guardRefresh34, orchRefresh34);
+    for (const advance of [0, 299_000]) {
+      fakeNow += advance;
+      callID++;
+      await beforeRefresh34(
+        { tool: 'task', sessionID: orchRefresh34, callID: 'call_' + callID },
+        { args: { subagent_type: 'executor', description: 'domain:implementation - ttl refresh', prompt: 'domain:implementation implement the planned change' } }
+      );
+    }
+    fakeNow += 2_000;
+    await expectPass('34.5 successful same-type task refreshes bridge TTL', () => {
+      callID++;
+      return beforeRefresh34(
+        { tool: 'bash', sessionID: 'ses_unregistered_refreshed_34', callID: 'call_' + callID, args: { command: 'npm install' } },
+        { args: { command: 'npm install' } }
+      );
+    });
+  } finally {
+    Date.now = realDateNow;
+  }
+}
+
+{
+  const guardPre34 = await DelegationGuard({
+    project: { id: 'test-project-predelegate-arming-34' }, client: mockClient, $: async () => {},
+    directory: projectRoot('predelegate-arming34'), worktree: projectRoot('predelegate-arming34')
+  });
+  const beforePre34 = guardPre34['tool.execute.before'];
+  const eventPre34 = guardPre34['event'];
+  const orchPre34 = 'ses_orch_predelegate_34';
+  await eventPre34({ event: { type: 'session.created', properties: { sessionID: orchPre34, info: { agent: 'orchestrator' } } } });
+  await preloadConductorRules(guardPre34, orchPre34);
+  callID++;
+  await beforePre34(
+    { tool: 'task', sessionID: orchPre34, callID: 'call_' + callID },
+    { args: { subagent_type: 'explorer', description: 'domain:exploration - predelegate bridge', prompt: 'domain:exploration inspect project structure' } }
+  );
+  await expectPass('34.6 successful canPreDelegate target still arms the identity bridge', () => {
+    callID++;
+    return beforePre34(
+      { tool: 'bash', sessionID: 'ses_unregistered_explorer_34', callID: 'call_' + callID, args: { command: 'git status' } },
+      { args: { command: 'git status' } }
+    );
+  });
+}
+
+console.log('--- 35. Project-scoped audit path and unknown-identity labels (REV-03 + audit containment) ---');
+{
+  const auditWorktree35 = mkdtempSync(path.join(os.tmpdir(), 'delegation-guard-project-audit-'));
+  try {
+    const unreliablePluginDir35 = path.join(auditWorktree35, '.opencode', 'plugins');
+    const guard35 = await DelegationGuard({
+      project: { id: 'test-project-audit-location-35' }, client: mockClient, $: async () => {},
+      directory: unreliablePluginDir35, worktree: auditWorktree35
+    });
+    const before35 = guard35['tool.execute.before'];
+    const event35 = guard35['event'];
+    await event35({ event: { type: 'session.created', properties: { sessionID: 'ses_root_audit_35', info: { agent: 'orchestrator' } } } });
+    const unknown35 = 'ses_unknown_audit_35';
+
+    for (const [tool, args] of [
+      ['bash', { command: 'node --version' }],
+      ['edit', { filePath: 'src/a.js', oldString: 'a', newString: 'b' }],
+      ['write', { filePath: 'src/a.js', content: 'x' }]
+    ]) {
+      await expectBlock(`35.${tool} unknown identity reports the real actor`, () => {
+        callID++;
+        return before35({ tool, sessionID: unknown35, callID: 'call_' + callID, args }, { args });
+      }, 'unknown identity');
+    }
+
+    await expectPass('35.4 audit JSONL is written under the reliable project worktree with uniform unknown labels', () => {
+      const auditDir = path.join(auditWorktree35, '.planning', 'audit');
+      if (!existsSync(auditDir)) throw new Error(`project audit directory missing: ${auditDir}`);
+      const auditFile = readdirSync(auditDir).find(name => /^audit-.*\.jsonl$/.test(name));
+      if (!auditFile) throw new Error('project audit JSONL missing');
+      const events = readFileSync(path.join(auditDir, auditFile), 'utf8').trim().split(/\r?\n/).map(line => JSON.parse(line));
+      for (const check of ['bash_block', 'edit_block', 'write_block']) {
+        const event = events.find(entry => entry.details?.check === check);
+        if (!event) throw new Error(`missing ${check} audit event`);
+        if (event.agent !== 'unknown') throw new Error(`${check} agent expected unknown, found ${event.agent}`);
+      }
+    });
+
+    const legitimatePluginsRoot35 = path.join(auditWorktree35, 'opencode', 'plugins', 'app');
+    const guardPlugins35 = await DelegationGuard({
+      project: { id: 'test-project-legitimate-plugins-path-35' }, client: mockClient, $: async () => {},
+      directory: legitimatePluginsRoot35, worktree: legitimatePluginsRoot35
+    });
+    const beforePlugins35 = guardPlugins35['tool.execute.before'];
+    const eventPlugins35 = guardPlugins35['event'];
+    await eventPlugins35({ event: { type: 'session.created', properties: { sessionID: 'ses_root_plugins_35', info: { agent: 'orchestrator' } } } });
+    await expectBlock('35.5 setup: unknown write under a legitimate path containing plugins', () => {
+      callID++;
+      const args = { filePath: 'src/app.js', content: 'x' };
+      return beforePlugins35({ tool: 'write', sessionID: 'ses_unknown_plugins_35', callID: 'call_' + callID, args }, { args });
+    }, 'unknown identity');
+    await expectPass('35.6 a legitimate project path containing plugins keeps project-scoped audit', () => {
+      const auditDir = path.join(legitimatePluginsRoot35, '.planning', 'audit');
+      if (!existsSync(auditDir)) throw new Error(`legitimate plugins project audit missing: ${auditDir}`);
+    });
+
+    const caseWorktree35 = path.join(auditWorktree35, 'case-variant-worktree');
+    const guardCase35 = await DelegationGuard({
+      project: { id: 'test-project-case-variant-plugin-path-35' }, client: mockClient, $: async () => {},
+      directory: path.join(caseWorktree35, '.OpenCode', 'Plugins'), worktree: caseWorktree35
+    });
+    const beforeCase35 = guardCase35['tool.execute.before'];
+    const eventCase35 = guardCase35['event'];
+    await eventCase35({ event: { type: 'session.created', properties: { sessionID: 'ses_root_case_35', info: { agent: 'orchestrator' } } } });
+    await expectBlock('35.7 setup: case-variant OpenCode plugin directory emits an audit event', () => {
+      callID++;
+      const args = { filePath: 'src/app.js', content: 'x' };
+      return beforeCase35({ tool: 'write', sessionID: 'ses_unknown_case_35', callID: 'call_' + callID, args }, { args });
+    }, 'unknown identity');
+    await expectPass('35.8 OpenCode plugin path matching is case-insensitive', () => {
+      const auditDir = path.join(caseWorktree35, '.planning', 'audit');
+      if (!existsSync(auditDir)) throw new Error(`case-variant worktree audit missing: ${auditDir}`);
+    });
+  } finally {
+    rmSync(auditWorktree35, { recursive: true, force: true });
+  }
+}
+
+console.log('--- 36. Windows S4/S5 enforcement paths ---');
+{
+  const guard36 = await DelegationGuard({
+    project: { id: 'test-project-windows-paths-36' }, client: mockClient, $: async () => {},
+    directory: projectRoot('windows-paths36'), worktree: projectRoot('windows-paths36')
+  });
+  const before36 = guard36['tool.execute.before'];
+  const event36 = guard36['event'];
+  const root36 = 'ses_root_windows_36';
+  const executor36 = 'ses_executor_windows_36';
+  await event36({ event: { type: 'session.created', properties: { sessionID: root36, info: { agent: 'orchestrator' } } } });
+  await event36({ event: { type: 'session.created', properties: { sessionID: executor36, info: { agent: 'executor', parentID: root36 } } } });
+
+  await expectBlock('36.1 S4 direct Windows SSH private-key path is blocked', () => {
+    callID++;
+    const args = { filePath: 'C:\\Users\\test\\.ssh\\id_rsa' };
+    return before36({ tool: 'read', sessionID: executor36, callID: 'call_' + callID, args }, { args });
+  }, 'ssh_keys');
+  await expectBlock('36.2 S4 PowerShell Get-Content SSH private-key path is blocked', () => {
+    callID++;
+    const args = { command: 'Get-Content C:\\Users\\test\\.ssh\\id_rsa' };
+    return before36({ tool: 'bash', sessionID: executor36, callID: 'call_' + callID, args }, { args });
+  }, 'ssh_keys');
+  await expectBlock('36.3 S5 relative traversal is blocked for mutative file tools', () => {
+    callID++;
+    const args = { filePath: '..\\..\\..\\win.ini', oldString: 'a', newString: 'b' };
+    return before36({ tool: 'edit', sessionID: executor36, callID: 'call_' + callID, args }, { args });
+  }, 'PATH TRAVERSAL');
+  await expectBlock('36.4 S5 root shell traversal attempt is blocked by the orchestrator gate', () => {
+    callID++;
+    const args = { command: 'Get-Content ..\\..\\..\\win.ini' };
+    return before36({ tool: 'bash', sessionID: root36, callID: 'call_' + callID, args }, { args });
+  }, 'Delegate instead of using bash directly');
+}
+
+console.log('--- 37. Harness failure exit status ---');
+await expectPass('37.1 Harness reporter exits non-zero when failures are present', () => {
+  const reporterUrl = new URL('./test-harness-results.mjs', import.meta.url).href;
+  const script = `import { reportHarnessResults } from ${JSON.stringify(reporterUrl)}; reportHarnessResults(0, 1, ['forced failure']);`;
+  const child = spawnSync(process.execPath, ['--input-type=module', '--eval', script], { encoding: 'utf8' });
+  if (child.status !== 1) throw new Error(`expected exit status 1, found ${child.status}`);
+  if (!child.stdout.includes('1 failed') || !child.stdout.includes('forced failure')) {
+    throw new Error(`missing failure report in child stdout: ${child.stdout}`);
+  }
+});
+
+reportHarnessResults(pass, fail, failures);
+process.chdir(originalCwd);
+rmSync(testRoot, { recursive: true, force: true });

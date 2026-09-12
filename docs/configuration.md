@@ -51,7 +51,7 @@ The matching definitions are in [`agents/`](../agents/): `codebase-mapper`, `cod
 | Path | Purpose |
 |---|---|
 | `delegation-guard-runtime.log` | Runtime diagnostics next to plugin file. Truncated to 1 MB on plugin load. |
-| `.planning/audit/audit-YYYY-MM-DD.jsonl` | Structured audit events next to plugin file. |
+| `.planning/audit/audit-YYYY-MM-DD.jsonl` | Structured audit events in the project directory (worktree fallback when `directory` is unreliable; plugin directory only as last resort). |
 | `.planning/INCIDENTS.md` | Denied-event registry in project directory. |
 | `.opencode/metrics_count.json` | Incident counters in project directory. |
 | `.planning/LESSONS.md` | Repeated incident lessons in project directory (was `~/.config/opencode/LESSONS.md` before 2026-09-11; the old homedir file is not migrated). |
@@ -66,7 +66,7 @@ Audit events contain timestamp, session ID, event type, agent, action, and optio
 - Shell checks reject sensitive-file access, destructive commands, protected-branch force pushes, and mutating commands for read-only profiles.
 - Executor test execution is always blocked (`noTestExecution: true` is hardcoded in the fallback profile and in the shipped config); verifier owns validation.
 - Secret output scanning recognizes selected GitHub, AWS, private-key, bearer, JWT, OpenAI, Slack, Google, Supabase, Modal, URL-credential, and generic JSON credential patterns.
-- The guard excludes its own source/config/test files and log files from output scanning because they contain textual examples. This is intentional and means those files must still be handled as untrusted input.
+- The guard excludes its own source/config/test files, log files, and specifically `.planning/BACKLOG.md` from output scanning because they contain textual examples. The backlog exclusion is path-scoped: another `BACKLOG.md` remains scanned. These files must still be handled as untrusted input.
 
 ## Known behavior
 
