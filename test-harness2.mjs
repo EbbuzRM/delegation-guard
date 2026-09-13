@@ -683,7 +683,7 @@ console.log('--- 14. SECRET SCAN: false positive when reading the Guard source f
   );
 
   await expectPass('reading delegation-guard.js is NOT redacted (contains only textual examples)', async () => {
-    const output = { args: { filePath: 'C:\\Users\\test\\.opencode\\plugins\\delegation-guard.js' }, output: 'sample comment: .ssh folder, id_rsa key in path .ssh/id_rsa' };
+    const output = { args: { filePath: 'C:\\Users\\test\\.opencode\\plugins\\delegation-guard.js' }, output: 'sample comment: -----BEGIN PRIVATE KEY-----' };
     await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
     if (output.output.includes('REDACTED')) {
       throw new Error(`expected intact content, found: ${output.output}`);
@@ -691,28 +691,41 @@ console.log('--- 14. SECRET SCAN: false positive when reading the Guard source f
   });
 
   await expectPass('reading .planning/BACKLOG.md is NOT redacted (scoped policy documentation exclusion)', async () => {
-    const output = { args: { filePath: '.planning\\BACKLOG.md' }, output: 'planned Windows probe: .ssh/id_rsa' };
+    const output = { args: { filePath: '.planning\\BACKLOG.md' }, output: 'planned matcher example: -----BEGIN PRIVATE KEY-----' };
     await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
     if (output.output.includes('REDACTED')) throw new Error(`expected intact backlog, found: ${output.output}`);
   });
 
   await expectPass('reading docs/BACKLOG.md remains subject to secret redaction', async () => {
-    const output = { args: { filePath: 'C:\\project\\docs\\BACKLOG.md' }, output: 'private key: .ssh/id_rsa' };
+    const output = { args: { filePath: 'C:\\project\\docs\\BACKLOG.md' }, output: '-----BEGIN PRIVATE KEY-----' };
     await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
     if (!output.output.includes('REDACTED')) throw new Error(`expected REDACTED outside .planning, found: ${output.output}`);
   });
 
   await expectPass('nested .planning/BACKLOG.md remains subject to secret redaction', async () => {
-    const output = { args: { filePath: 'nested\\.planning\\BACKLOG.md' }, output: 'private key: .ssh/id_rsa' };
+    const output = { args: { filePath: 'nested\\.planning\\BACKLOG.md' }, output: '-----BEGIN PRIVATE KEY-----' };
     await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
     if (!output.output.includes('REDACTED')) throw new Error(`expected REDACTED for nested backlog, found: ${output.output}`);
   });
 
-  await expectPass('reading a NON-excluded file with a real secret still gets redacted (no regression)', async () => {
-    const output = { args: { filePath: 'C:\\Users\\test\\project\\some-other-file.js' }, output: 'private key: .ssh/id_rsa' };
+  await expectPass('reading a NON-excluded file with a real private key still gets redacted (no regression)', async () => {
+    const output = { args: { filePath: 'C:\\Users\\test\\project\\some-other-file.js' }, output: '-----BEGIN PRIVATE KEY-----' };
     await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
     if (!output.output.includes('REDACTED')) {
       throw new Error(`expected REDACTED, found intact content: ${output.output}`);
+    }
+  });
+
+  await expectPass('reading .planning/SESSION.md keeps a textual .ssh/id_rsa reference without key material', async () => {
+    // A path reference is not secret material. Access to the path remains
+    // protected by checkSensitiveFileAccess before a tool runs.
+    const output = {
+      args: { filePath: '.planning/SESSION.md' },
+      output: 'Line 795: example SSH private-key path is .ssh/id_rsa; no key content is present.'
+    };
+    await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
+    if (output.output.includes('REDACTED')) {
+      throw new Error(`expected intact documentation excerpt, found: ${output.output}`);
     }
   });
 }

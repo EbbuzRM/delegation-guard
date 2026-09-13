@@ -424,7 +424,6 @@ const SECRET_PATTERNS = [
   { name: 'Supabase token', regex: /sbp_[a-zA-Z0-9]{40,}/g, severity: 'high' },
   { name: 'Generic API key in JSON', regex: /"(apiKey|api_key|password|secret|token)"\s*:\s*"[a-zA-Z0-9_\-]{16,}"/g, severity: 'medium' },
   { name: 'JWT token', regex: /eyJ[a-zA-Z0-9_\-]+\.eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+/g, severity: 'high' },
-  { name: 'Generic private key path', regex: /\.ssh\/id_[a-zA-Z0-9]+/g, severity: 'medium' },
   // Added 2026-08-15 — reported missing coverage: OpenAI, Slack, Google.
   // Length thresholds chosen to avoid false positives on common words/identifiers
   // common that start with the same prefix (e.g. "sk-" alone is too short,
