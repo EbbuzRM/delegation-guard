@@ -1,176 +1,19 @@
 // @ts-check
 import path from 'node:path'
-import { appendFileSync, existsSync, mkdirSync, writeFileSync, readFileSync, statSync, renameSync, truncateSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, statSync, truncateSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { createConfigLoader } from './guard-config.js'
+import { createAuditPersistence } from './guard-audit.js'
+import { createSessionState } from './guard-state.js'
 
-
-let _projectDirectory = ''
-/** Fallback for the containment check when _projectDirectory is unreliable (see validatePathZone). */
-let _worktree = ''
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const runtimeLogPath = path.join(__dirname, 'delegation-guard-runtime.log')
 
-// ============================================
-// CONFIG LOADING — made resilient for ESM contexts
-// ============================================
-// Global cache: once loaded, it is not re-read.
-// Loading is moved into the factory (where project/directory are available).
-/** @type {Record<string, any> | null} */
-let _cachedAgentProfiles = null
-/** Path of the external config file currently in cache (for runtime change detection) */
-let _cachedConfigSource = null
-/** mtimeMs of the config file at caching time (for automatic invalidation) */
-let _cachedConfigMtime = null
-/** Timestamp of the last check of the config file on disk (for throttling) */
-let _lastConfigCheckTime = 0
-
-/**
- * Deep merge: overwrites values of `source` onto `target`.
- * - Recursive objects
- * - Arrays replaced (not concatenated) — expected behavior for allowlist, neverDo, etc.
- * - Overwritten primitives
- *
- * @param {Record<string, any>} target
- * @param {Record<string, any>} source
- * @returns {Record<string, any>} mutated target
- */
-function deepMerge(target, source) {
-  for (const key of Object.keys(source)) {
-    const sVal = source[key]
-    const tVal = target[key]
-    if (
-      sVal && typeof sVal === 'object' && !Array.isArray(sVal) &&
-      tVal && typeof tVal === 'object' && !Array.isArray(tVal)
-    ) {
-      deepMerge(tVal, sVal)
-    } else {
-      target[key] = sVal
-    }
-  }
-  return target
-}
-
-/**
- * Tries to read guard-config.json from multiple possible locations.
- * Order: 1) path relative to project directory, 2) absolute path (__dirname).
- *
- * @param {string | undefined} projectDir - project directory (from OpenCode factory)
- * @returns {{ profiles: Record<string, any>, source: string } | null}
- */
-function tryLoadGuardConfig(projectDir) {
-  const candidates = [
-    // 1. Relative to the project directory (most reliable in ESM)
-    ...(projectDir ? [path.join(projectDir, '.opencode', 'plugins', 'guard-config.json')] : []),
-    // 2. Relative to plugins if project dir is the root
-    ...(projectDir ? [path.join(projectDir, 'plugins', 'guard-config.json')] : []),
-    // 3. Absolute path next to the plugin itself (__dirname)
-    path.join(__dirname, 'guard-config.json')
-  ]
-
-  for (const candidate of candidates) {
-    try {
-      if (!existsSync(candidate)) continue
-      const content = readFileSync(candidate, 'utf8')
-      const parsed = JSON.parse(content)
-      if (parsed.agentProfiles && typeof parsed.agentProfiles === 'object') {
-        return { profiles: parsed.agentProfiles, source: candidate }
-      }
-    } catch {
-      // Continue with the next candidate
-    }
-  }
-  return null
-}
-
-/**
- * Loads and caches agent profiles.
- * If external loading fails, uses the fallback and logs the error.
-  * If external loading succeeds, does a deep merge: the MINIMAL safety-net
-  * fallback is the base, explicit external values override. The full
-  * policy (neverDo, keywords, allowMentions, allowlists, scopes) lives in
-  * guard-config.json — the fallback only fills structural gaps when the
-  * external config omits a field, and takes over entirely (fail-closed on
-  * mutative capabilities) when the config is missing.
- *
- * @param {string | undefined} projectDir
- * @returns {Record<string, any>}
- */
-function loadAgentProfiles(projectDir) {
-  // If cache is populated, check if the config file on disk has changed.
-  // Automatic invalidation based on mtime: if guard-config.json is
-// modified at runtime, profiles are reloaded without restarting the process.
-  if (_cachedAgentProfiles) {
-    // Fallback cache (no external file): no reload needed.
-    if (!_cachedConfigSource) return _cachedAgentProfiles
-
-    // Throttling: performs disk check at most once every 5 seconds (5000ms)
-    const now = Date.now()
-    if (now - _lastConfigCheckTime < 5000) {
-      return _cachedAgentProfiles
-    }
-    _lastConfigCheckTime = now
-
-    try {
-      if (existsSync(_cachedConfigSource)) {
-        const mtime = statSync(_cachedConfigSource).mtimeMs
-        if (mtime === _cachedConfigMtime) {
-          return _cachedAgentProfiles
-        }
-        runtimeLog(`Guard config modified (mtime ${_cachedConfigMtime} → ${mtime}) — reloading from ${_cachedConfigSource}`)
-      } else {
-        // File removed: force reload (will fall back if not found elsewhere)
-        runtimeLog(`Guard config removed (${_cachedConfigSource}) — reloading`)
-      }
-    } catch (e) {
-      runtimeLog(`Cache mtime check failed: ${e.message} — keeping cache`)
-      return _cachedAgentProfiles
-    }
-    // mtime changed (or file removed): invalidate cache and reload below
-    _cachedAgentProfiles = null
-    _cachedConfigSource = null
-    _cachedConfigMtime = null
-  }
-
-  const fallback = createAgentProfilesFallback()
-  const external = tryLoadGuardConfig(projectDir)
-
-  if (!external) {
-    console.error('[Guard] guard-config.json not found in any location — using MINIMAL safety-net fallback (bash/webfetch/sub-delegation: total deny)')
-    _cachedAgentProfiles = fallback
-    _cachedConfigSource = null
-    _cachedConfigMtime = null
-    return _cachedAgentProfiles
-  }
-
-  // Deep merge: minimal safety-net fallback as base, external config overrides
-  // explicit fields. guard-config.json is the single source of truth for the
-  // full policy; the fallback only fills gaps for fields the external config
-  // omits (it defines no policy itself — M2 2026-09-10).
-  for (const agentKey of Object.keys(fallback)) {
-    if (external.profiles[agentKey]) {
-      deepMerge(fallback[agentKey], external.profiles[agentKey])
-    }
-  }
-  // Add any agents present only in external config
-  for (const agentKey of Object.keys(external.profiles)) {
-    if (!fallback[agentKey]) {
-      fallback[agentKey] = external.profiles[agentKey]
-    }
-  }
-
-  runtimeLog(`Guard config loaded from: ${external.source} (merge with fallback)`)
-  _cachedAgentProfiles = fallback
-  _cachedConfigSource = external.source
-  try {
-    _cachedConfigMtime = existsSync(external.source) ? statSync(external.source).mtimeMs : null
-  } catch {
-    _cachedConfigMtime = null
-  }
-  return _cachedAgentProfiles
-}
-
 function runtimeLog(message) {
+  const isDebug = process.env.OPENCODE_GUARD_DEBUG === '1'
+  const isSecurityEvent = /^(blocked:|❌|🚨)|SECRET DETECTED|AUDIT-ERROR/.test(message)
+  if (!isDebug && !isSecurityEvent) return
   try {
     const timestamp = new Date().toLocaleString('en-US', { timeZone: 'Europe/Rome' })
     appendFileSync(runtimeLogPath, `[${timestamp}] ${message}\n`, 'utf8')
@@ -417,7 +260,10 @@ const SECRET_PATTERNS = [
   // GitHub PAT: ghp_ + at least 30 alphanumeric characters (real format: ghp_ + 36, but we accept 30+ for robustness)
   { name: 'GitHub PAT', regex: /ghp_[a-zA-Z0-9]{30,}/g, severity: 'critical' },
   { name: 'AWS Access Key', regex: /AKIA[0-9A-Z]{16}/g, severity: 'critical' },
-  { name: 'Private Key (RSA/EC/OPENSSH)', regex: /-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g, severity: 'critical' },
+  // A PEM header alone is commonly quoted in documentation and diffs. Require
+  // its first Base64 payload line, while allowing truncated output after that
+  // line (without requiring a matching END header).
+  { name: 'Private Key (RSA/EC/OPENSSH)', regex: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----\r?\n[A-Za-z0-9+/]{32,}={0,2}(?=\r?$|\r?\n)/g, severity: 'critical' },
   { name: 'URL with credentials', regex: /https?:\/\/[^\s/:]+:[^\s@]+@[^\s/]+/g, severity: 'high' },
   { name: 'Bearer token', regex: /Bearer\s+[a-zA-Z0-9_\-\.]{20,}/g, severity: 'high' },
   { name: 'Modal API key', regex: /modalresearch_[a-zA-Z0-9_\-]{20,}/g, severity: 'high' },
@@ -573,7 +419,7 @@ function extractTargetAgent(input, output) {
 
 /**
  * Detects whether the task concerns writing/updating documentation.
- * @param {string} fullText - The full prompt
+ * @param {string} text - The full prompt
  * @returns {boolean} true if the task is documentation
  */
 function isDocumentationTask(text) {
@@ -827,10 +673,10 @@ function checkDelegationLoop(currentStack, targetAgent) {
 // ============================================
 /** @type {Plugin} */
 export const DelegationGuard = async ({ project, client, $, directory, worktree }) => {
-  _projectDirectory = directory || '';
-  _worktree = worktree || '';
+  const projectDirectory = directory || ''
+  const projectWorktree = worktree || ''
   try {
-    runtimeLog(`DelegationGuard factory called: project=${project ? 'yes' : 'no'}, client=${client ? 'yes' : 'no'}, directory=${directory || ''}, worktree=${worktree || ''}`)
+    runtimeLog(`DelegationGuard factory called: project=${project ? 'yes' : 'no'}, client=${client ? 'yes' : 'no'}, directory=${projectDirectory}, worktree=${projectWorktree}`)
   // INIT LOG: Confirm the plugin is loaded
   const initLogPath = path.join(__dirname, '.planning', 'guard-init.log')
   try {
@@ -936,20 +782,28 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
    *   allowMentions: string[],
    *   neverDo: string[],
    *   canPreDelegate: boolean,
+   *   allowEdit?: boolean,
+   *   readOnlyDespiteFullBash?: boolean,
+   *   noTestExecution?: boolean,
+   *   trustedForSecrets?: boolean,
    *   bashAllowlist?: string[],
    *   canWebfetch?: boolean,
    *   canDelegateTo?: string[],
    *   writeScope?: 'all' | 'planning' | 'sketches' | 'spikes' | 'readme'
    * }} AgentProfile
-   * @type {Record<string, AgentProfile>}
+   * @type {(projectDir?: string) => {profiles: Record<string, AgentProfile>, workflowPolicy: {requireConductorRules: boolean, requireDiagnosisBeforeExecutor: boolean, requireVerifierAfterExecutor: boolean}}}
    */
-  const agentProfiles = loadAgentProfiles(directory)
-  const auditProjectRoot = isReliableProjectRoot(directory)
-    ? directory
-    : (isReliableProjectRoot(worktree) ? worktree : __dirname)
+  const configLoader = createConfigLoader({ pluginDirectory: __dirname, onDiagnostic: runtimeLog })
+  const { profiles: agentProfiles, workflowPolicy } = configLoader(projectDirectory)
+  const auditProjectRoot = isReliableProjectRoot(projectDirectory)
+    ? projectDirectory
+    : (isReliableProjectRoot(projectWorktree) ? projectWorktree : __dirname)
   const auditLogDir = path.join(auditProjectRoot, '.planning', 'audit')
-  const persistProjectAuditEvent = (sessionId, eventType, agent, action, details = {}) =>
-    persistAuditEvent(auditLogDir, auditProjectRoot, sessionId, eventType, agent, action, details)
+  const persistProjectAuditEvent = createAuditPersistence({
+    auditLogDir,
+    projectDirectory: auditProjectRoot,
+    onDiagnostic: runtimeLog
+  })
 
   // ============================================
   // HELPERS
@@ -1177,7 +1031,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
       // process) — if OpenCode is closed and reopened on the SAME session, the flag
       // is lost even if the rules are already in context/history. wasConductorRulesLoadedInHistory
       // checks the message history before blocking, to avoid requiring an unnecessary reload.
-      if (isOrchestrator) {
+      if (isOrchestrator && workflowPolicy.requireConductorRules) {
         if (input.tool === 'skill' && output?.args?.name === 'conductor-rules') {
           state.conductorRulesLoaded = true;
           sessionState.set(sessionID, state);
@@ -1418,7 +1272,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
         }
         
         auditedCheck(sessionID, editAgent, 'edit_path', () => {
-          checkEditPath(editAgent, filePath)
+          checkEditPath(editAgent, filePath, projectDirectory, projectWorktree)
         }, { filePath })
         return
       }
@@ -1450,7 +1304,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
           return
         }
         auditedCheck(sessionID, writeAgent, 'write_path', () => {
-          checkWritePath(writeAgent, filePath, exists, state.scopeViolationTargets)
+          checkWritePath(writeAgent, filePath, exists, state.scopeViolationTargets, projectDirectory, projectWorktree)
         }, { filePath, exists })
         return
       }
@@ -1565,7 +1419,9 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
           const workflowSequenceWithCaller = !isOrchestrator && subagentType
             ? [...(state.delegationSequence || []), subagentType]
             : (state.delegationSequence || [])
-          auditedCheck(sessionID, targetAgent, 'workflow', () => checkWorkflowSequence(targetAgent, fullText, workflowSequenceWithCaller, agentProfiles), { agent: targetAgent, fullTextPreview: fullText.substring(0, 100) })
+          if (workflowPolicy.requireDiagnosisBeforeExecutor) {
+            auditedCheck(sessionID, targetAgent, 'workflow', () => checkWorkflowSequence(targetAgent, fullText, workflowSequenceWithCaller, agentProfiles), { agent: targetAgent, fullTextPreview: fullText.substring(0, 100) })
+          }
 
           runtimeLog(`WORKFLOW CHECK: sessionID=${sessionID} delegationSequence=${JSON.stringify(state.delegationSequence)}, targetAgent=${targetAgent}`)
 
@@ -1581,7 +1437,7 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
           // — the same flag already used for the mutation-check, single source
           // of truth instead of two lists that can get out of sync.
           const lastDelegated = (state.delegationSequence || [])[(state.delegationSequence || []).length - 1]
-          if (lastDelegated === 'executor' &&
+          if (workflowPolicy.requireVerifierAfterExecutor && lastDelegated === 'executor' &&
               targetAgent !== 'verifier' &&
               targetAgent !== 'executor' &&
               targetAgent !== 'doc-writer' &&
@@ -1827,185 +1683,6 @@ export const DelegationGuard = async ({ project, client, $, directory, worktree 
 //  - getSessionState(sessionID) → returns the current state of the session
 
 // ============================================
-// CHECK B — Audit log persistence to disk
-// ============================================
-// Writes audit events in JSONL format (one JSON event per line) in
-// `audit-YYYY-MM-DD.jsonl` inside the configured directory. Production default:
-// `<project>/.planning/audit`; if `directory` is unreliable, the factory uses
-// the worktree, then falls back to the plugin directory only as a last resort.
-//
-// Event schema:
-//   { timestamp, sessionId, eventType, agent, action, details }
-//
-// - `eventType`: 'secret' | 'sensitive' | 'webfetch' | 'delegation' | 'denied'
-// - `action`:    'redacted' | 'allowed' | 'blocked' | 'executed'
-// - `details`:   optional, type-specific
-//
-// Resilience: write errors do NOT propagate (they log to console.error
-// with prefix `[GUARD-AUDIT-ERROR]`). The guard must never block on
-// I/O problems on the audit log.
-
-/**
- * Manages the persistence of incidents and lessons learned when an event is 'denied'.
- * @param {string} projectDirectory
- * @param {string} agent 
- * @param {Record<string, any>} details 
- */
-/**
- * Sanitizes text before interpolating it
- * (both markdown files in append). Without this, an attacker-controlled
- * value (e.g. subagent_type in a ROUTING error, or a bash command
- * truncated in a SHELL MUTATION error) containing `\n### [INC-9999] ...`
- * can inject a fake entry in the audit trail — CR/LF is the only way to
- * start a new markdown line, so removing them neutralizes
- * the injection regardless of the content of the rest of the string.
- * @param {unknown} value
- * @returns {string}
- */
-function sanitizeForMarkdownLog(value) {
-  const text = value === null || value === undefined ? '' : String(value)
-  return text.replace(/[\r\n]+/g, ' ⏎ ')
-}
-
-function handleDeniedEvent(projectDirectory, agent, details) {
-  try {
-    if (!projectDirectory) {
-      runtimeLog(`handleDeniedEvent: projectDirectory not set. Skipping persistence.`);
-      return;
-    }
-    if (projectDirectory.endsWith(path.sep + '.opencode') || projectDirectory.includes(path.sep + '.opencode' + path.sep)) {
-        runtimeLog(`handleDeniedEvent: projectDirectory is inside .opencode (${projectDirectory}). Skipping persistence.`);
-        return;
-    }
-    const metricsPath = path.resolve(projectDirectory, '.opencode', 'metrics_count.json');
-    const incidentsPath = path.resolve(projectDirectory, '.planning', 'INCIDENTS.md');
-    // FIX (2026-09-11, LESSONS containment): lessons used to be written to
-    // ~/.config/opencode/LESSONS.md — OUTSIDE the project containment, so
-    // denied phrases from one project leaked into a cross-project file.
-    // Now co-located with INCIDENTS.md in the project's .planning/ dir
-    // (same project-root mechanism, same append semantics). The old
-    // homedir file, if present, is user data and is NOT touched/migrated.
-    const lessonsPath = path.resolve(projectDirectory, '.planning', 'LESSONS.md');
-    const metricsDir = path.dirname(metricsPath);
-    const planningDir = path.dirname(incidentsPath);
-    const lessonsDir = path.dirname(lessonsPath);
-
-    if (!existsSync(metricsDir)) mkdirSync(metricsDir, { recursive: true });
-    if (!existsSync(planningDir)) mkdirSync(planningDir, { recursive: true });
-    if (!existsSync(lessonsDir)) mkdirSync(lessonsDir, { recursive: true });
-
-    let metrics = { total_incidents: 0, counts: {}, lessons_written: {} };
-    if (existsSync(metricsPath)) {
-      try {
-        metrics = JSON.parse(readFileSync(metricsPath, 'utf8'));
-      } catch (e) {
-        runtimeLog(`Error reading metrics: ${e.message}`);
-      }
-    }
-
-    metrics.total_incidents++;
-    const incidentId = `INC-${metrics.total_incidents.toString().padStart(4, '0')}`;
-    // Sanitized: agent, checkName, and details.error can contain text
-    // attacker-controlled (e.g. arbitrary subagent_type, bash command
-    // truncated) — without this a CR/LF inside them can forge a
-    // fake entry in the audit log (see sanitizeForMarkdownLog).
-    const checkName = sanitizeForMarkdownLog(details.check || 'unknown_check');
-    const safeAgent = sanitizeForMarkdownLog(agent);
-    const safeError = sanitizeForMarkdownLog(details.error || 'No details provided');
-    const now = new Date();
-    const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-
-    const incidentEntry = `\n### [${incidentId}] [${checkName}] | ${dateStr} | ${safeAgent} | Status: blocked | ${safeError}\n`;
-
-    appendFileSync(incidentsPath, incidentEntry, 'utf8');
-
-    const lessonKey = `${agent}:${details.check || 'unknown_check'}`;
-    metrics.counts[lessonKey] = (metrics.counts[lessonKey] || 0) + 1;
-
-    if (metrics.counts[lessonKey] === 2 && !metrics.lessons_written[lessonKey]) {
-      const synthesis = safeError.replace(/^❌ [^:]+: /, '');
-      const lessonEntry = `- [${dateStr}] ${safeAgent} attempted ${checkName} $\rightarrow$ ${synthesis}\n`;
-      appendFileSync(lessonsPath, lessonEntry, 'utf8');
-      metrics.lessons_written[lessonKey] = true;
-    }
-
-    // Atomic write (temp file + rename) instead of direct writeFileSync.
-    // Does not eliminate the read-modify-write race if OpenCode were to execute the
-    // plugin in separate concurrent processes on the same project (not
-    // verifiable from here) — but avoids a concurrent reader seeing a JSON
-    // partially written/corrupted during a non-atomic rename.
-    const metricsTmpPath = `${metricsPath}.tmp-${process.pid}-${Date.now()}`;
-    writeFileSync(metricsTmpPath, JSON.stringify(metrics, null, 2), 'utf8');
-    renameSync(metricsTmpPath, metricsPath);
-  } catch (e) {
-    runtimeLog(`Denied event persistence failed: ${e.message}`);
-  }
-}
-
-/**
- * Appends an audit event to the file `audit-YYYY-MM-DD.jsonl`.
- * - Creates the directory if it doesn't exist (`mkdirSync` recursive).
- * - Encoding UTF-8, line separator `\n`.
- * - Write errors are logged in `console.error` and NOT propagated.
- *
- * @param {string} auditLogDir - Per-instance audit directory
- * @param {string} projectDirectory - Per-instance project root for denied-event files
- * @param {string} sessionId - OpenCode session ID
- * @param {string} eventType - Event type ('secret'|'sensitive'|'webfetch'|'delegation'|'denied')
- * @param {string|null} agent - Agent that generated the event (or null)
- * @param {string} action - Action ('redacted'|'allowed'|'blocked'|'executed')
- * @param {Record<string, any>} [details] - Optional type-specific details
- */
-function persistAuditEvent(auditLogDir, projectDirectory, sessionId, eventType, agent, action, details = {}) {
-  try {
-    if (!existsSync(auditLogDir)) {
-      mkdirSync(auditLogDir, { recursive: true })
-    }
-    const now = new Date()
-    const pad = (/** @type {number} */ n) => n.toString().padStart(2, '0')
-
-    const dateStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}` // YYYY-MM-DD local
-    const filename = `audit-${dateStr}.jsonl`
-    const filepath = path.join(auditLogDir, filename)
-    const event = {
-      timestamp: getLocalTimestamp(),
-      sessionId: sessionId || 'unknown',
-      eventType,
-      agent: agent || null,
-      action,
-      details
-    }
-    appendFileSync(filepath, JSON.stringify(event) + '\n', 'utf8')
-
-    if (eventType === 'denied') {
-      handleDeniedEvent(projectDirectory, agent || 'unknown', details);
-    }
-  } catch (e) {
-    // Write errors must NOT block the guard.
-    console.error('[GUARD-AUDIT-ERROR]', e instanceof Error ? e.message : String(e))
-  }
-}
-
-/**
- * Creates an initial session state.
- * M4 (2026-09-10): the two legacy context/history fields removed — dead state
- * (never read nor written anywhere else), pinned by M4 analysis.
- * @returns {{ phase: 'idle'|'pre-delegation'|'delegated', lastAgent: string|null, webfetchAudit: any[], secretDetectionAudit: any[], delegationSequence: string[] }}
- */
-function createSessionState() {
-  return {
-    phase: /** @type {'idle'} */ ('idle'),
-    lastAgent: null,
-    webfetchAudit: /** @type {any[]} */ ([]),
-    secretDetectionAudit: /** @type {any[]} */ ([]),
-    delegationStack: /** @type {string[]} */ ([]),
-    delegationSequence: /** @type {string[]} */ ([]),
-    taskRetries: /** @type {Record<string, number>} */ ({}),
-    conductorRulesLoaded: false,
-    scopeViolationTargets: /** @type {Record<string, number>} */ ({})
-  }
-}
-
 /**
  * Normalizes a filePath for the forbidden zone check.
  * - Handles path traversal (../)
@@ -2059,39 +1736,6 @@ function normalizePathForCheck(filePath) {
  *     stay read-only and executor keeps its edit/no-test semantics even
  *     without config.
  */
-const SAFETY_NET_FALLBACK_ROLE = 'safety-net fallback (guard-config.json missing)'
-/** @type {(overrides?: Record<string, any>) => any} */
-const makeSafetyNetProfile = (overrides = {}) => ({
-  role: SAFETY_NET_FALLBACK_ROLE,
-  bashAllowlist: [],      // fail-closed: no bash at all without config
-  canWebfetch: false,
-  canDelegateTo: [],      // fail-closed: sub-delegation backstop denies all
-  neverDo: [],            // REV-03: policy lives in guard-config.json only
-  keywords: [],
-  allowMentions: [],
-  canPreDelegate: false,
-  writeScope: 'all',
-  delegation_rules: { can_handle_directly: ['*'] }, // REV-03: routing stays operational
-  ...overrides,
-})
-
-/** @type {() => any} */
-const createAgentProfilesFallback = () => ({
-  // allowEdit / readOnlyDespiteFullBash / writeScope / canPreDelegate /
-  // noTestExecution below = values preserved from the pre-M2 fallback.
-  'codebase-mapper': makeSafetyNetProfile({ allowEdit: false, readOnlyDespiteFullBash: true, canPreDelegate: true, writeScope: 'all' }),
-  'code-reviewer': makeSafetyNetProfile({ allowEdit: false, readOnlyDespiteFullBash: true, writeScope: 'all' }),
-  'debugger': makeSafetyNetProfile({ allowEdit: false, readOnlyDespiteFullBash: true, writeScope: 'all' }),
-  'doc-writer': makeSafetyNetProfile({ allowEdit: true, writeScope: 'readme' }),
-  'executor': makeSafetyNetProfile({ allowEdit: true, writeScope: 'all', noTestExecution: true }),
-  'explorer': makeSafetyNetProfile({ allowEdit: false, readOnlyDespiteFullBash: true, canPreDelegate: true, writeScope: 'planning' }),
-  'security-auditor': makeSafetyNetProfile({ allowEdit: false, readOnlyDespiteFullBash: true, writeScope: 'all' }),
-  'sketcher': makeSafetyNetProfile({ allowEdit: true, writeScope: 'sketches' }),
-  'spiker': makeSafetyNetProfile({ allowEdit: true, writeScope: 'spikes' }),
-  'tester': makeSafetyNetProfile({ allowEdit: true, writeScope: 'all' }),
-  'verifier': makeSafetyNetProfile({ allowEdit: false, readOnlyDespiteFullBash: true, writeScope: 'all' }),
-})
-
 // ============================================
 // CHECK FUNCTIONS — PRIVATE TO CLOSURE
 // ============================================
@@ -2465,8 +2109,10 @@ function checkSensitiveFileAccess(agent, filePath, toolName) {
  * @param {string} agent - Agent name (e.g. 'executor')
  * @param {string} filePath - Path to validate
  * @param {'edit'|'write'} opType - Operation type (for error message)
+ * @param {string} projectDirectory - Factory-local project directory
+ * @param {string} worktree - Factory-local worktree fallback
  */
-function validatePathZone(agent, filePath, opType) {
+function validatePathZone(agent, filePath, opType, projectDirectory = '', worktree = '') {
   if (!agent || typeof agent !== 'string') {
     throw new Error(`❌ GUARD: invalid agent in check${opType === 'edit' ? 'Edit' : 'Write'}Path. Delegation/routing invalid.`)
   }
@@ -2494,20 +2140,20 @@ function validatePathZone(agent, filePath, opType) {
     throw new Error(`❌ PATH: ${opType} on ${filePath} is blocked — Guard audit trail, not modifiable by any agent.`)
   }
   // Project containment check. OpenCode sometimes passes directory=plugins\
-  // as project directory (see session on 2026-07-12) — _projectDirectory in that
+  // as project directory (see session on 2026-07-12) — the factory directory in that
   // case is not reliable as a containment root.
   //
   // FIX (2026-08-15): the old code SKIPPED containment entirely
-  // when _projectDirectory was unreliable — no other check here stops an
+  // when the factory directory was unreliable — no other check here stops an
   // absolute path outside the project (the "PATH TRAVERSAL" check above only catches
   // initial "../", not an absolute path elsewhere), so in that scenario
   // edit/write on ANY file on the filesystem passed without any block.
-  // Now, if _projectDirectory is unreliable, we use `worktree` (passed from
+  // Now, if the factory directory is unreliable, we use `worktree` (passed from
   // the OpenCode factory, typically the real git worktree root) as the root
   // of fallback before giving up entirely.
-  const projectRoot = isReliableProjectRoot(_projectDirectory)
-    ? _projectDirectory
-    : (isReliableProjectRoot(_worktree) ? _worktree : '')
+  const projectRoot = isReliableProjectRoot(projectDirectory)
+    ? projectDirectory
+    : (isReliableProjectRoot(worktree) ? worktree : '')
   if (projectRoot) {
     const resolvedPath = path.resolve(filePath);
     const resolvedProject = path.resolve(projectRoot);
@@ -2547,14 +2193,14 @@ function isReliableProjectRoot(dir) {
  * @param {string} agent - Agent name (e.g. 'executor')
  * @param {string} filePath - Path of the file to edit
  */
-function checkEditPath(agent, filePath) {
+function checkEditPath(agent, filePath, projectDirectory = '', worktree = '') {
   // FIX (2026-07-25): the sensitive pattern scan was entirely missing for edit —
   // only read/grep/glob had it (line ~932). An agent with allowEdit:true
   // could overwrite .env/SSH keys/credentials without any block, as long as
   // the path was inside the project (validatePathZone doesn't care, it checks
   // only project boundaries, not the sensitive content of the path).
   checkSensitiveFileAccess(agent, filePath, 'edit')
-  validatePathZone(agent, filePath, 'edit')
+  validatePathZone(agent, filePath, 'edit', projectDirectory, worktree)
 }
 
 /** Agents with writeScope restricted to throwaway folders, and their pattern/label. */
@@ -2608,7 +2254,7 @@ function throwOrEscalateScopeViolation(agent, filePath, scopeViolationTargets, b
  * @param {Record<string, number>} [scopeViolationTargets] - state.scopeViolationTargets of the session (only for agents with restricted writeScope)
  * @throws {Error} if write to an existing file is not allowed
  */
-function checkWritePath(agent, filePath, exists, scopeViolationTargets) {
+function checkWritePath(agent, filePath, exists, scopeViolationTargets, projectDirectory = '', worktree = '') {
   // FIX (2026-07-25): same hole as checkEditPath — missing pattern scan
   // for sensitive files on write.
   checkSensitiveFileAccess(agent, filePath, 'write')
@@ -2616,7 +2262,7 @@ function checkWritePath(agent, filePath, exists, scopeViolationTargets) {
   const restriction = RESTRICTED_WRITE_SCOPE_AGENTS[agent]
 
   try {
-    validatePathZone(agent, filePath, 'write')
+    validatePathZone(agent, filePath, 'write', projectDirectory, worktree)
   } catch (err) {
     if (restriction && scopeViolationTargets) {
       throwOrEscalateScopeViolation(agent, filePath, scopeViolationTargets, err.message)

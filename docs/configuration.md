@@ -1,6 +1,6 @@
 # Configuration and operations
 
-`guard-config.json` is the external policy source for agent profiles. The plugin loads it from three candidate locations in order: (1) `.opencode/plugins/guard-config.json` inside the project directory, (2) `plugins/guard-config.json` at the project root, or (3) the installed plugin directory next to `delegation-guard.js`. External values override fallback values; arrays replace arrays.
+`guard-config.json` is the external policy source for agent profiles. The plugin loads it from three candidate locations in order: (1) `.opencode/plugins/guard-config.json` inside the project directory, (2) `plugins/guard-config.json` at the project root, or (3) the installed plugin directory next to `delegation-guard.js`. External values override fallback values; arrays replace arrays. `guard-config.js` owns loading, validation, workflow normalization, and the per-factory cache; `guard-audit.js` owns project-scoped audit persistence; `guard-state.js` owns the session-state schema. Install all three beside `delegation-guard.js`.
 
 ## Profile schema
 
@@ -9,6 +9,17 @@ Configuration root:
 | Field | Type | Meaning |
 |---|---|---|
 | `agentProfiles` | object | Map of agent name to profile. Required for external config to load. |
+| `workflowPolicy` | object | Optional procedural gates. Missing or invalid values default to `true`; technical safety checks are unaffected. |
+
+`workflowPolicy` fields:
+
+| Field | Type | Default | Meaning |
+|---|---|---:|---|
+| `requireConductorRules` | boolean | `true` | Require the orchestrator to load `conductor-rules` before delegating. |
+| `requireDiagnosisBeforeExecutor` | boolean | `true` | Require diagnosis/analysis before executor tasks that describe a fix. |
+| `requireVerifierAfterExecutor` | boolean | `true` | Require verifier follow-up after an executor delegation. |
+
+These toggles change workflow procedure only. Unknown identities, sensitive-file checks, destructive-command checks, project containment, and real-secret redaction remain fail-closed.
 
 Profile fields:
 
@@ -50,7 +61,7 @@ The matching definitions are in [`agents/`](../agents/): `codebase-mapper`, `cod
 
 | Path | Purpose |
 |---|---|
-| `delegation-guard-runtime.log` | Runtime diagnostics next to plugin file. Truncated to 1 MB on plugin load. |
+| `delegation-guard-runtime.log` | Opt-in runtime diagnostics next to plugin file (`OPENCODE_GUARD_DEBUG=1`); truncated to 1 MB on plugin load. Security blocks and audit errors remain logged. |
 | `.planning/audit/audit-YYYY-MM-DD.jsonl` | Structured audit events in the project directory (worktree fallback when `directory` is unreliable; plugin directory only as last resort). |
 | `.planning/INCIDENTS.md` | Denied-event registry in project directory. |
 | `.opencode/metrics_count.json` | Incident counters in project directory. |

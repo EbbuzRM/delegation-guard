@@ -1,4 +1,9 @@
 {
+  "workflowPolicy": {
+    "requireConductorRules": true,
+    "requireDiagnosisBeforeExecutor": true,
+    "requireVerifierAfterExecutor": true
+  },
   "agentProfiles": {
     "codebase-mapper": {
       "role": "codebase mapping",

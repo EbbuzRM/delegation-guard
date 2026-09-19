@@ -83,7 +83,7 @@ cd delegation-guard
 
 ```bash
 mkdir -p ~/.config/opencode/plugins/delegation-guard ~/.config/opencode/agents
-cp delegation-guard.js guard-config.json ~/.config/opencode/plugins/delegation-guard/
+cp delegation-guard.js guard-config.js guard-audit.js guard-state.js guard-config.json ~/.config/opencode/plugins/delegation-guard/
 cp agents/*.md ~/.config/opencode/agents/
 ```
 
@@ -93,7 +93,7 @@ cp agents/*.md ~/.config/opencode/agents/
 $plugin = "$env:USERPROFILE\.config\opencode\plugins\delegation-guard"
 $agents = "$env:USERPROFILE\.config\opencode\agents"
 New-Item -ItemType Directory -Force -Path $plugin, $agents | Out-Null
-Copy-Item delegation-guard.js, guard-config.json $plugin
+Copy-Item delegation-guard.js, guard-config.js, guard-audit.js, guard-state.js, guard-config.json $plugin
 Copy-Item agents\*.md $agents
 ```
 
@@ -151,7 +151,7 @@ Restart OpenCode after editing the config. See the [OpenCode plugin documentatio
 
 ## Configuration
 
-Everything is centralized in `guard-config.json`. Each agent profile declares its permissions, delegation targets, write scope, and domain routing. Minimal custom-agent entry:
+Agent permissions, delegation targets, write scope, and domain routing are configured in `guard-config.json`; `guard-config.js` loads and validates the configuration locally for each plugin factory. `guard-audit.js` and `guard-state.js` are runtime dependencies and must stay beside the entry point. Minimal custom-agent entry:
 
 ```json
 {
@@ -174,6 +174,20 @@ Everything is centralized in `guard-config.json`. Each agent profile declares it
 ```
 
 The runtime deep-merges external profiles with its built-in fallback profiles; **arrays replace** inherited arrays (they do not concatenate). Add a matching `my-agent.md` under OpenCode's `agents/` directory.
+
+The optional `workflowPolicy` object controls only procedural gates. All three values default to `true`, preserving the secure default behavior:
+
+```json
+{
+  "workflowPolicy": {
+    "requireConductorRules": true,
+    "requireDiagnosisBeforeExecutor": true,
+    "requireVerifierAfterExecutor": true
+  }
+}
+```
+
+Technical safety checks (unknown identities, sensitive paths, destructive commands, project containment, and real-secret redaction) remain fail-closed and are not configurable through these workflow toggles.
 
 For the full field reference, shipped-agent list, data paths, and defaults, see [docs/configuration.md](docs/configuration.md). To contribute, see [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
 
@@ -211,7 +225,7 @@ Every delegated task must declare a domain. Add `domain:<name>` to the task prom
 Output scanning is post-execution (`tool.execute.after`). The tool already ran; redaction only cleans the returned object. Check the audit log for what was captured, and keep credentials outside the worktree.
 
 **Guard not loading.**
-Ensure the plugin is listed in your OpenCode configuration and that `delegation-guard.js` and `guard-config.json` are in the plugin directory. Verify that agent `.md` files are in the OpenCode `agents/` directory.
+Ensure the plugin is listed in your OpenCode configuration and that `delegation-guard.js`, `guard-config.js`, `guard-audit.js`, `guard-state.js`, and `guard-config.json` are in the plugin directory. Verify that agent `.md` files are in the OpenCode `agents/` directory.
 
 ## Limitations
 

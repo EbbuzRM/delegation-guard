@@ -8,3 +8,4 @@ setup-autostart.ps1
 .obsidian-second-brain.json
 graphify-out/
 sync-to-opencode.ps1
+.local-backups/

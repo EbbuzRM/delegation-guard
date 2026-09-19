@@ -1,10 +1,11 @@
 import { DelegationGuard } from './delegation-guard.js';
-import { readFileSync, existsSync, rmSync, mkdirSync, mkdtempSync, copyFileSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, mkdtempSync, copyFileSync, readdirSync, utimesSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { reportHarnessResults } from './test-harness-results.mjs';
+import { createConfigLoader } from './guard-config.js';
 
 const mockClient = { tui: { showToast: async () => {} } };
 const originalCwd = process.cwd();
@@ -657,13 +658,11 @@ console.log('--- 13. UNKNOWN SUBAGENT_TYPE: delegating to an unconfigured agent 
   });
 }
 
-console.log('--- 14. SECRET SCAN: false positive when reading the Guard source files ---');
+console.log('--- 14. SECRET SCAN: PEM key material requires a plausible Base64 payload ---');
 {
-  // Real incident on 2026-08-15: delegation-guard.js holds TEXTUAL examples of
-  // sensitive patterns in its own comments (documenting what the patterns
-  // detect) — reading it triggered redaction of the whole file. Verify both
-  // that the Guard files are now excluded, and that generic detection on
-  // OTHER files was NOT weakened by the exclusion.
+  // PEM headers occur in docs and diffs. Only a header followed immediately by
+  // plausible Base64 key material is secret output; a truncated real key still
+  // has its first Base64 line and must remain redacted.
   const guardSecret = await DelegationGuard({
     project: { id: 'test-project-secret-scan' }, client: mockClient, $: async () => {},
     directory: projectRoot('secret-scan'), worktree: projectRoot('secret-scan')
@@ -682,34 +681,77 @@ console.log('--- 14. SECRET SCAN: false positive when reading the Guard source f
     { args: { filePath: 'README.md' } }
   );
 
-  await expectPass('reading delegation-guard.js is NOT redacted (contains only textual examples)', async () => {
-    const output = { args: { filePath: 'C:\\Users\\test\\.opencode\\plugins\\delegation-guard.js' }, output: 'sample comment: -----BEGIN PRIVATE KEY-----' };
+  await expectPass('isolated PRIVATE KEY header in a non-excluded file is not redacted', async () => {
+    const output = { args: { filePath: 'C:\\Users\\test\\project\\docs\\example.md' }, output: 'sample comment: -----BEGIN PRIVATE KEY-----' };
     await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
     if (output.output.includes('REDACTED')) {
       throw new Error(`expected intact content, found: ${output.output}`);
     }
   });
 
-  await expectPass('reading .planning/BACKLOG.md is NOT redacted (scoped policy documentation exclusion)', async () => {
-    const output = { args: { filePath: '.planning\\BACKLOG.md' }, output: 'planned matcher example: -----BEGIN PRIVATE KEY-----' };
+  await expectPass('diff citing .ssh/id_rsa and an isolated PEM header is not redacted', async () => {
+    const output = {
+      args: { filePath: 'C:\\Users\\test\\project\\changes.diff' },
+      output: 'diff --git a/.ssh/id_rsa b/.ssh/id_rsa\n--- a/.ssh/id_rsa\n+++ b/.ssh/id_rsa\n+-----BEGIN PRIVATE KEY-----\n'
+    };
+    await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
+    if (output.output.includes('REDACTED')) throw new Error(`expected intact diff, found: ${output.output}`);
+  });
+
+  await expectPass('reading delegation-guard.js remains excluded even with PEM key material', async () => {
+    const output = {
+      args: { filePath: 'C:\\Users\\test\\.opencode\\plugins\\delegation-guard.js' },
+      output: `documented fixture: -----BEGIN PRIVATE KEY-----\n${'Q'.repeat(32)}`
+    };
+    await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
+    if (output.output.includes('REDACTED')) throw new Error(`expected intact Guard source, found: ${output.output}`);
+  });
+
+  await expectPass('reading .planning/BACKLOG.md remains excluded with PEM key material', async () => {
+    const output = {
+      args: { filePath: '.planning\\BACKLOG.md' },
+      output: `planned matcher fixture: -----BEGIN PRIVATE KEY-----\n${'Q'.repeat(32)}`
+    };
     await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
     if (output.output.includes('REDACTED')) throw new Error(`expected intact backlog, found: ${output.output}`);
   });
 
-  await expectPass('reading docs/BACKLOG.md remains subject to secret redaction', async () => {
-    const output = { args: { filePath: 'C:\\project\\docs\\BACKLOG.md' }, output: '-----BEGIN PRIVATE KEY-----' };
+  await expectPass('docs/BACKLOG.md with PEM key material remains subject to redaction', async () => {
+    const output = {
+      args: { filePath: 'C:\\project\\docs\\BACKLOG.md' },
+      output: `-----BEGIN PRIVATE KEY-----\n${'Q'.repeat(32)}`
+    };
     await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
     if (!output.output.includes('REDACTED')) throw new Error(`expected REDACTED outside .planning, found: ${output.output}`);
   });
 
-  await expectPass('nested .planning/BACKLOG.md remains subject to secret redaction', async () => {
-    const output = { args: { filePath: 'nested\\.planning\\BACKLOG.md' }, output: '-----BEGIN PRIVATE KEY-----' };
+  await expectPass('nested .planning/BACKLOG.md with PEM key material remains subject to redaction', async () => {
+    const output = {
+      args: { filePath: 'nested\\.planning\\BACKLOG.md' },
+      output: `-----BEGIN PRIVATE KEY-----\n${'Q'.repeat(32)}`
+    };
     await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
     if (!output.output.includes('REDACTED')) throw new Error(`expected REDACTED for nested backlog, found: ${output.output}`);
   });
 
-  await expectPass('reading a NON-excluded file with a real private key still gets redacted (no regression)', async () => {
-    const output = { args: { filePath: 'C:\\Users\\test\\project\\some-other-file.js' }, output: '-----BEGIN PRIVATE KEY-----' };
+  for (const keyType of ['RSA ', 'EC ', 'OPENSSH ']) {
+    await expectPass(`${keyType.trim()} PRIVATE KEY with a CRLF Base64 payload is redacted`, async () => {
+      const output = {
+        args: { filePath: 'C:\\Users\\test\\project\\some-other-file.js' },
+        output: `-----BEGIN ${keyType}PRIVATE KEY-----\r\n${'Q'.repeat(64)}\r\n`
+      };
+      await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
+      if (!output.output.includes('REDACTED')) {
+        throw new Error(`expected REDACTED, found intact content: ${output.output}`);
+      }
+    });
+  }
+
+  await expectPass('truncated PRIVATE KEY output with its first Base64 line is redacted', async () => {
+    const output = {
+      args: { filePath: 'C:\\Users\\test\\project\\truncated-output.txt' },
+      output: `-----BEGIN PRIVATE KEY-----\n${'Q'.repeat(32)}`
+    };
     await afterSecret({ tool: 'read', sessionID: subSessionSecret }, output);
     if (!output.output.includes('REDACTED')) {
       throw new Error(`expected REDACTED, found intact content: ${output.output}`);
@@ -1020,6 +1062,18 @@ console.log('--- 22. neverDo enforcement + fallback safety-net (M2 regression) -
     copyFileSync(
       path.join(path.dirname(fileURLToPath(import.meta.url)), 'delegation-guard.js'),
       copiedPlugin
+    );
+    copyFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), 'guard-config.js'),
+      path.join(fallbackDir, 'guard-config.js')
+    );
+    copyFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), 'guard-audit.js'),
+      path.join(fallbackDir, 'guard-audit.js')
+    );
+    copyFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), 'guard-state.js'),
+      path.join(fallbackDir, 'guard-state.js')
     );
     const { DelegationGuard: DelegationGuardFallback } = await import(pathToFileURL(copiedPlugin).href);
     const guardFallback = await DelegationGuardFallback({
@@ -1452,6 +1506,18 @@ console.log('--- 28. Bridge fallback (currentActiveAgent) on the FALLBACK instan
     copyFileSync(
       path.join(path.dirname(fileURLToPath(import.meta.url)), 'delegation-guard.js'),
       copiedPlugin28
+    );
+    copyFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), 'guard-config.js'),
+      path.join(fallbackDir28, 'guard-config.js')
+    );
+    copyFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), 'guard-audit.js'),
+      path.join(fallbackDir28, 'guard-audit.js')
+    );
+    copyFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), 'guard-state.js'),
+      path.join(fallbackDir28, 'guard-state.js')
     );
     const { DelegationGuard: DelegationGuardFallback28 } = await import(pathToFileURL(copiedPlugin28).href);
     const guardFB28 = await DelegationGuardFallback28({
@@ -2129,6 +2195,125 @@ await expectPass('37.1 Harness reporter exits non-zero when failures are present
     throw new Error(`missing failure report in child stdout: ${child.stdout}`);
   }
 });
+
+console.log('--- 38. Factory isolation and configurable workflow policy ---');
+{
+  const configSource = JSON.parse(readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'guard-config.json'), 'utf8'));
+  const isolationRoot = mkdtempSync(path.join(os.tmpdir(), 'delegation-guard-isolation-'));
+    const projectA = path.join(isolationRoot, 'project-a');
+    const projectB = path.join(isolationRoot, 'project-b');
+    const projectC = path.join(isolationRoot, 'project-c');
+    const invalidProject = path.join(isolationRoot, 'invalid-project');
+
+  function writeProjectConfig(projectDir, mutate) {
+    const configDir = path.join(projectDir, '.opencode', 'plugins');
+    mkdirSync(configDir, { recursive: true });
+    const config = structuredClone(configSource);
+    mutate(config);
+    writeFileSync(path.join(configDir, 'guard-config.json'), JSON.stringify(config, null, 2), 'utf8');
+  }
+
+  try {
+    writeProjectConfig(projectA, (config) => {
+      config.agentProfiles.executor.neverDo = ['project-a-only action'];
+      config.agentProfiles.executor.allowMentions = [];
+    });
+    writeProjectConfig(projectB, (config) => {
+      config.agentProfiles.executor.neverDo = [];
+      config.agentProfiles.executor.allowMentions = [];
+    });
+    writeProjectConfig(projectC, (config) => {
+      config.workflowPolicy = {
+        requireConductorRules: false,
+        requireDiagnosisBeforeExecutor: false,
+        requireVerifierAfterExecutor: false
+      };
+    });
+    writeProjectConfig(invalidProject, (config) => {
+      config.agentProfiles.executor.allowEdit = 'yes';
+    });
+
+    const reloadLoader = createConfigLoader({ pluginDirectory: path.dirname(fileURLToPath(import.meta.url)) });
+    const reloadConfigPath = path.join(projectA, '.opencode', 'plugins', 'guard-config.json');
+    const initialReloadConfig = reloadLoader(projectA);
+    const reloadConfig = JSON.parse(readFileSync(reloadConfigPath, 'utf8'));
+    reloadConfig.agentProfiles.executor.neverDo = ['reloaded project-a action'];
+    writeFileSync(reloadConfigPath, JSON.stringify(reloadConfig, null, 2), 'utf8');
+    utimesSync(reloadConfigPath, new Date(), new Date(Date.now() + 2000));
+    const realNow = Date.now;
+    Date.now = () => realNow() + 6000;
+    const refreshedReloadConfig = reloadLoader(projectA);
+    Date.now = realNow;
+    await expectPass('38.0 config cache reloads after file change', () => {
+      if (initialReloadConfig.profiles.executor.neverDo.includes('reloaded project-a action')) {
+        throw new Error('initial config unexpectedly contained the reloaded policy');
+      }
+      if (!refreshedReloadConfig.profiles.executor.neverDo.includes('reloaded project-a action')) {
+        throw new Error('changed config was not reloaded');
+      }
+    });
+    const invalidLoader = createConfigLoader({ pluginDirectory: path.join(isolationRoot, 'missing-plugin') });
+    const invalidConfigResult = invalidLoader(invalidProject);
+    await expectPass('38.0b malformed profile falls back fail-closed', () => {
+      if (invalidConfigResult.profiles.executor.bashAllowlist.length !== 0 ||
+          invalidConfigResult.profiles.executor.canWebfetch !== false ||
+          invalidConfigResult.profiles.executor.canDelegateTo.length !== 0 ||
+          !invalidConfigResult.workflowPolicy.requireConductorRules ||
+          !invalidConfigResult.workflowPolicy.requireDiagnosisBeforeExecutor ||
+          !invalidConfigResult.workflowPolicy.requireVerifierAfterExecutor) {
+        throw new Error('malformed configuration widened the safety-net');
+      }
+    });
+    writeProjectConfig(projectA, (config) => {
+      config.agentProfiles.executor.neverDo = ['project-a-only action'];
+      config.agentProfiles.executor.allowMentions = [];
+    });
+
+    const guardA = await DelegationGuard({ project: { id: 'isolation-a' }, client: mockClient, $: async () => {}, directory: projectA, worktree: projectA });
+    const guardB = await DelegationGuard({ project: { id: 'isolation-b' }, client: mockClient, $: async () => {}, directory: projectB, worktree: projectB });
+    const guardC = await DelegationGuard({ project: { id: 'isolation-c' }, client: mockClient, $: async () => {}, directory: projectC, worktree: projectC });
+    const beforeA = guardA['tool.execute.before'];
+    const beforeB = guardB['tool.execute.before'];
+    const beforeC = guardC['tool.execute.before'];
+
+    await preloadConductorRules(guardA, 'ses_isolation_root_a');
+    await preloadConductorRules(guardB, 'ses_isolation_root_b');
+    await expectBlock('38.1 project-specific config stays isolated in factory A', () => {
+      callID++;
+      return beforeA(
+        { tool: 'task', sessionID: 'ses_isolation_root_a', callID: 'call_' + callID },
+        { args: { subagent_type: 'executor', description: 'domain:implementation project-a-only action', prompt: 'domain:implementation root cause known' } }
+      );
+    }, 'project-a-only action');
+    await expectPass('38.2 second factory does not inherit first project config', () => {
+      callID++;
+      return beforeB(
+        { tool: 'task', sessionID: 'ses_isolation_root_b', callID: 'call_' + callID },
+        { args: { subagent_type: 'executor', description: 'domain:implementation project-a-only action', prompt: 'domain:implementation root cause known' } }
+      );
+    });
+    await expectPass('38.3 workflow gates can be disabled without changing security policy', () => {
+      callID++;
+      return beforeC(
+        { tool: 'task', sessionID: 'ses_isolation_root_c', callID: 'call_' + callID },
+        { args: { subagent_type: 'executor', description: 'domain:implementation apply fix', prompt: 'domain:implementation apply fix' } }
+      );
+    });
+
+    const executorA = 'ses_isolation_executor_a';
+    await guardA.event({ event: { type: 'session.created', properties: { sessionID: executorA, info: { agent: 'executor', parentID: 'ses_isolation_root_a' } } } });
+    const projectFileA = path.join(projectA, 'src', 'guarded.js');
+    await expectPass('38.4 path containment remains bound to the originating factory', () => {
+      callID++;
+      return beforeA(
+        { tool: 'edit', sessionID: executorA, callID: 'call_' + callID, args: { filePath: projectFileA } },
+        { args: { filePath: projectFileA } }
+      );
+    });
+  } finally {
+    rmSync(isolationRoot, { recursive: true, force: true });
+  }
+}
 
 reportHarnessResults(pass, fail, failures);
 process.chdir(originalCwd);

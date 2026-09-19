@@ -3,7 +3,7 @@
 ## Before changing files
 
 1. Read [`README.md`](../README.md), [`docs/configuration.md`](configuration.md), and the relevant agent profile.
-2. Keep runtime behavior and configuration claims synchronized with `delegation-guard.js`, `guard-config.json`, and `test-harness2.mjs`.
+2. Keep runtime behavior and configuration claims synchronized with `delegation-guard.js`, `guard-config.js`, `guard-audit.js`, `guard-state.js`, `guard-config.json`, and `test-harness2.mjs`.
 3. Do not add credentials, private keys, or real secrets to source, fixtures, logs, or documentation.
 
 ## Changes
@@ -20,6 +20,10 @@ Run from repository root:
 
 ```bash
 node test-harness2.mjs
+node --check delegation-guard.js
+node --check guard-config.js
+node --check guard-audit.js
+node --check guard-state.js
 ```
 
 Review the complete output and confirm zero failures. If OpenCode compatibility is affected, test with the target OpenCode version as well.
